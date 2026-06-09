@@ -111,20 +111,30 @@ static double g_magSum = 0, g_magSumSq = 0;
 // --- gyro zero-rate offset we remove ourselves (BMI270 bias drifts w/ temp)
 static float  g_gyroBias[3] = {0, 0, 0};
 
-// --- live outputs
-static float  g_pitch = 0, g_roll = 0;             // averaged (high-confidence)
+// --- live outputs (averaged = high-confidence; inst = latest single sample) ---
+static float  g_pitch = 0, g_roll = 0;             // averaged tilt (settled)
 static float  g_avgAx = 0, g_avgAy = 0, g_avgAz = 1; // offset-corrected averaged accel
-static float  g_instPitch = 0, g_instRoll = 0;     // instantaneous (for moving events)
-static float  g_instAx = 0, g_instAy = 0, g_instAz = 1;
+static float  g_avgRawAx = 0, g_avgRawAy = 0, g_avgRawAz = 1; // averaged RAW accel
+static float  g_instPitch = 0, g_instRoll = 0;     // instantaneous tilt
+static float  g_instAx = 0, g_instAy = 0, g_instAz = 1;       // offset-corrected
+static float  g_instRawAx = 0, g_instRawAy = 0, g_instRawAz = 1; // latest RAW accel
+static float  g_gx = 0, g_gy = 0, g_gz = 0;        // latest RAW gyro (deg/s)
+static float  g_dispPitch = 0, g_dispRoll = 0;     // smoothed live tilt for the bubble
 static bool   g_settled = false;                   // at rest >= dwell time
 static int    g_stationaryStreak = 0;              // consecutive rest samples
 static float  g_imuTemp = NAN;
+
+// --- cached slow-changing reads (kept off the 100 Hz hot path) ----------------
+static int    g_battery = -1;
+static bool   g_charging = false;
 
 // --- calibration
 static bool    g_calibrated = false;
 static float   g_offX = 0, g_offY = 0, g_offZ = 0;
 static CalStep g_calStep = CAL_IDLE;
 static float   g_calA[3] = {0,0,0}, g_calB[3] = {0,0,0};
+static bool    g_calError = false;                 // last calibration validation failed
+static String  g_calResultMsg = "";               // shown on the CAL_DONE screen
 static Preferences g_prefs;
 
 // --- WiFi / time
@@ -182,7 +192,7 @@ static void wifiTick();
 static void setupWeb();
 static void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType, void*, uint8_t*, size_t);
 static void handleWsText(uint8_t* data, size_t len);
-static void buildStatus(String& out);
+static size_t buildStatus(char* buf, size_t cap);
 static void processCommands();
 static void handleTouch();
 static void updateDisplay();
@@ -259,7 +269,14 @@ static void imuSampleTick() {
   auto d = M5.Imu.getImuData();
   float ax = d.accel.x, ay = d.accel.y, az = d.accel.z;
   float gx = d.gyro.x,  gy = d.gyro.y,  gz = d.gyro.z;
-  float t; if (M5.Imu.getTemp(&t)) g_imuTemp = t;
+  g_gx = gx; g_gy = gy; g_gz = gz;                 // latest RAW gyro (for the CSV)
+
+  // The BMI270 die temperature changes slowly: poll it at TEMP_READ_INTERVAL_MS
+  // instead of every 100 Hz tick to keep the hot path light.
+  static uint32_t lastTemp = 0; uint32_t nowMs = millis();
+  if (nowMs - lastTemp >= TEMP_READ_INTERVAL_MS) {
+    lastTemp = nowMs; float t; if (M5.Imu.getTemp(&t)) g_imuTemp = t;
+  }
 
   // ---- de-biased gyro magnitude (gyro is used ONLY for rest detection) -------
   float dgx = gx - g_gyroBias[0], dgy = gy - g_gyroBias[1], dgz = gz - g_gyroBias[2];
@@ -287,19 +304,26 @@ static void imuSampleTick() {
     g_gyroBias[2] += GYRO_BIAS_ADAPT_ALPHA * (gz - g_gyroBias[2]);
   }
 
-  // ---- instantaneous (offset-corrected) reading — used for moving-event rows -
+  // ---- instantaneous reading: RAW + offset-corrected (live view, moving rows) -
+  g_instRawAx = ax; g_instRawAy = ay; g_instRawAz = az;
   g_instAx = ax - g_offX; g_instAy = ay - g_offY; g_instAz = az - g_offZ;
   anglesFromCorrected(g_instAx, g_instAy, g_instAz, &g_instPitch, &g_instRoll);
+
+  // Smoothed live tilt that drives the on-screen bubble: responsive yet steady.
+  g_dispPitch += BUBBLE_SMOOTH_ALPHA * (g_instPitch - g_dispPitch);
+  g_dispRoll  += BUBBLE_SMOOTH_ALPHA * (g_instRoll  - g_dispRoll);
 
   // ---- rest gating + N-sample average ----------------------------------------
   bool instStationary = gyroQuiet && accelQuiet;
   if (instStationary) {
     if (g_stationaryStreak < 1000000) g_stationaryStreak++;
     bufAdd(ax, ay, az);                            // accumulate raw, offset later
-    // averaged, offset-corrected accel -> high-confidence tilt
-    g_avgAx = (float)(g_sumAx / g_bufCount) - g_offX;
-    g_avgAy = (float)(g_sumAy / g_bufCount) - g_offY;
-    g_avgAz = (float)(g_sumAz / g_bufCount) - g_offZ;
+    g_avgRawAx = (float)(g_sumAx / g_bufCount);    // averaged RAW accel (for CSV)
+    g_avgRawAy = (float)(g_sumAy / g_bufCount);
+    g_avgRawAz = (float)(g_sumAz / g_bufCount);
+    g_avgAx = g_avgRawAx - g_offX;                 // offset-corrected -> tilt
+    g_avgAy = g_avgRawAy - g_offY;
+    g_avgAz = g_avgRawAz - g_offZ;
     anglesFromCorrected(g_avgAx, g_avgAy, g_avgAz, &g_pitch, &g_roll);
     g_settled = (g_stationaryStreak >= (int)DWELL_SAMPLES);
   } else {
@@ -354,13 +378,34 @@ static void calibrationTick() {
     g_calB[0] = (float)(g_sumAx / g_bufCount);
     g_calB[1] = (float)(g_sumAy / g_bufCount);
     g_calB[2] = (float)(g_sumAz / g_bufCount);
-    g_offX = (g_calA[0] + g_calB[0]) * 0.5f;          // flip/reversal average
-    g_offY = (g_calA[1] + g_calB[1]) * 0.5f;
-    g_offZ = 0.0f;                                    // Z left to optional scale cal
-    g_calibrated = true;
-    saveCalibration();
-    Serial.printf("[CAL] B = %.5f %.5f %.5f -> offsets X=%.5f Y=%.5f\n",
-                  g_calB[0], g_calB[1], g_calB[2], g_offX, g_offY);
+
+    // Validate the flip before trusting it: the device must have been roughly
+    // flat in both captures (Z vertical) and the 180 deg turn must have been
+    // about that vertical axis (az essentially unchanged). Otherwise the plate
+    // tilt would not cancel and the offsets would be wrong.
+    bool flatA = fabsf(fabsf(g_calA[2]) - 1.0f) < CAL_FLAT_TOL_G;
+    bool flatB = fabsf(fabsf(g_calB[2]) - 1.0f) < CAL_FLAT_TOL_G;
+    bool vert  = fabsf(g_calA[2] - g_calB[2])    < CAL_VERT_TOL_G;
+    if (!flatA || !flatB) {
+      g_calError = true;
+      g_calResultMsg = "FAILED: device was not flat (Z must be vertical, az ~ 1 g).";
+    } else if (!vert) {
+      g_calError = true;
+      g_calResultMsg = "FAILED: not a 180 deg turn about the VERTICAL axis.";
+    } else {
+      // flip/reversal: (A+B)/2 cancels residual plate tilt and isolates the
+      // sensor offset. Z is left at 0 — a uniform scale cancels in the atan2.
+      g_offX = (g_calA[0] + g_calB[0]) * 0.5f;
+      g_offY = (g_calA[1] + g_calB[1]) * 0.5f;
+      g_offZ = 0.0f;
+      g_calibrated = true;
+      g_calError = false;
+      g_calResultMsg = "Calibration complete and saved to NVS.";
+      saveCalibration();
+    }
+    Serial.printf("[CAL] B = %.5f %.5f %.5f -> %s (offX=%.5f offY=%.5f)\n",
+                  g_calB[0], g_calB[1], g_calB[2],
+                  g_calError ? "REJECTED" : "OK", g_offX, g_offY);
     g_calStep = CAL_DONE;
   }
 }
@@ -389,7 +434,7 @@ static String calPrompt() {
     case CAL_WAIT_B:    return "Step 2/2: Rotate 180 deg about the VERTICAL axis, same "
                                "spot. Hold still, then press Next.";
     case CAL_CAPTURE_B: return "Capturing orientation B - keep absolutely still...";
-    case CAL_DONE:      return "Calibration complete and saved to NVS. Press Finish.";
+    case CAL_DONE:      return g_calResultMsg + " Press Finish to exit.";
     default:            return "";
   }
 }
@@ -452,7 +497,7 @@ static void measureGyroBias() {
 // =============================================================================
 // Time helpers
 // =============================================================================
-static bool timeIsValid() { return time(nullptr) > 1700000000; } // ~2023-11 onward
+static bool timeIsValid() { return time(nullptr) > TIME_VALID_EPOCH; }
 
 static void isoTimestamp(char* buf, size_t n) {
   if (timeIsValid()) {
@@ -508,7 +553,8 @@ static bool openLog() {
   g_logFile = SD.open(g_logName.c_str(), FILE_WRITE);
   if (!g_logFile) { g_sdStatus = "open error";
                     Serial.printf("[SD] cannot open %s\n", g_logName.c_str()); return false; }
-  g_logFile.println("timestamp_iso,millis,pitch_deg,roll_deg,ax_g,ay_g,az_g,"
+  g_logFile.println("timestamp_iso,millis,pitch_deg,roll_deg,"
+                    "ax_g,ay_g,az_g,ax_raw_g,ay_raw_g,az_raw_g,gx_dps,gy_dps,gz_dps,"
                     "settled,calibrated,imu_temp_c,battery_pct,event_flag,event_label");
   g_logFile.flush();
   g_sdStatus = "ready";
@@ -528,14 +574,17 @@ static String csvField(const String& s) {           // quote+escape only if need
 static void writeRow(bool settled, int eventFlag, const String& label) {
   if (!g_sdOk || !g_logFile) return;                // tolerate missing card
   char ts[40]; isoTimestamp(ts, sizeof(ts));
-  float pitch = settled ? g_pitch  : g_instPitch;
-  float roll  = settled ? g_roll   : g_instRoll;
-  float ax    = settled ? g_avgAx  : g_instAx;
-  float ay    = settled ? g_avgAy  : g_instAy;
-  float az    = settled ? g_avgAz  : g_instAz;
-  int   bat   = M5.Power.getBatteryLevel();
+  // settled rows use the N-sample average; moving/event rows the latest sample.
+  float pitch = settled ? g_pitch    : g_instPitch;
+  float roll  = settled ? g_roll     : g_instRoll;
+  float ax    = settled ? g_avgAx    : g_instAx;      // offset-corrected (-> angle)
+  float ay    = settled ? g_avgAy    : g_instAy;
+  float az    = settled ? g_avgAz    : g_instAz;
+  float rax   = settled ? g_avgRawAx : g_instRawAx;   // raw accelerometer
+  float ray   = settled ? g_avgRawAy : g_instRawAy;
+  float raz   = settled ? g_avgRawAz : g_instRawAz;
 
-  String line; line.reserve(176);
+  String line; line.reserve(256);
   line += ts;                       line += ',';
   line += String(millis());         line += ',';
   line += String(pitch, ANGLE_DECIMALS); line += ',';
@@ -543,10 +592,16 @@ static void writeRow(bool settled, int eventFlag, const String& label) {
   line += String(ax, 5);            line += ',';
   line += String(ay, 5);            line += ',';
   line += String(az, 5);            line += ',';
+  line += String(rax, 5);           line += ',';     // raw accel x/y/z (no offset)
+  line += String(ray, 5);           line += ',';
+  line += String(raz, 5);           line += ',';
+  line += String(g_gx, 4);          line += ',';     // raw gyro x/y/z (deg/s)
+  line += String(g_gy, 4);          line += ',';
+  line += String(g_gz, 4);          line += ',';
   line += (settled ? '1' : '0');    line += ',';
   line += (g_calibrated ? '1' : '0'); line += ',';
   line += (isNan(g_imuTemp) ? String("nan") : String(g_imuTemp, 2)); line += ',';
-  line += String(bat);              line += ',';
+  line += String(g_battery);        line += ',';
   line += String(eventFlag);        line += ',';
   line += csvField(label);
 
@@ -710,7 +765,7 @@ static void setupWeb() {
   g_server.begin();
   Serial.println("[WEB] HTTP+WS server started on port 80");
 }
-static void buildStatus(String& out) {
+static size_t buildStatus(char* buf, size_t cap) {
   JsonDocument doc;
   doc["type"]       = "status";
   doc["pitch"]      = g_pitch;
@@ -721,8 +776,8 @@ static void buildStatus(String& out) {
   doc["ay"]         = g_settled ? g_avgAy : g_instAy;
   doc["az"]         = g_settled ? g_avgAz : g_instAz;
   if (!isNan(g_imuTemp)) doc["imu_temp"] = g_imuTemp; else doc["imu_temp"] = nullptr;
-  doc["battery"]    = M5.Power.getBatteryLevel();
-  doc["charging"]   = ((int)M5.Power.isCharging() == 1);
+  doc["battery"]    = g_battery;
+  doc["charging"]   = g_charging;
   doc["events"]     = g_eventCount;
   doc["wifi"]       = g_wifiStatus;
   doc["logging"]    = g_logging;
@@ -732,7 +787,8 @@ static void buildStatus(String& out) {
   doc["calStep"]    = calStepName();
   doc["calPrompt"]  = calPrompt();
   doc["calProgress"]= calProgress();
-  serializeJson(doc, out);
+  doc["calError"]   = g_calError;
+  return serializeJson(doc, buf, cap);          // into a fixed buffer (no heap churn)
 }
 
 // =============================================================================
@@ -808,7 +864,9 @@ static void drawCalScreen() {
   int W = g_canvas.width();
   g_canvas.setTextColor(TFT_CYAN); g_canvas.setTextSize(2);
   g_canvas.drawString("CALIBRATION", 8, 8);
-  g_canvas.setTextColor(TFT_WHITE); g_canvas.setTextSize(1);
+  uint16_t promptCol = (g_calStep == CAL_DONE) ? (g_calError ? TFT_RED : TFT_GREEN)
+                                               : TFT_WHITE;
+  g_canvas.setTextColor(promptCol); g_canvas.setTextSize(1);
   drawWrapped(calPrompt(), 8, 40, W - 16, 12);
   int pct = calProgress(), by = 150, bw = W - 16, bh = 16;
   g_canvas.drawRect(8, by, bw, bh, TFT_WHITE);
@@ -821,6 +879,58 @@ static void drawCalScreen() {
           capturing ? TFT_DARKGREY : TFT_NAVY);
   drawBtn(g_btnCalCancel, "CANCEL", TFT_MAROON);
 }
+
+// Auto-ranging full-scale (degrees at the rim) for the bubble, with hysteresis
+// so the chosen step is stable. Mutates a static index -> call once per frame.
+static float bubbleFullScaleDeg() {
+  static const float steps[] = BUBBLE_SCALE_STEPS;
+  static const int   N = (int)(sizeof(steps) / sizeof(steps[0]));
+  static int idx = 0;
+  float mag = fmaxf(fabsf(g_dispPitch), fabsf(g_dispRoll));
+  while (idx < N - 1 && mag > steps[idx] * BUBBLE_FILL_FRACTION) idx++;        // zoom out
+  while (idx > 0      && mag < steps[idx - 1] * BUBBLE_SHRINK_FRACTION) idx--; // zoom in
+  return steps[idx];
+}
+
+// Draw a bullseye spirit level: rings + crosshair + a "level" target ring, with
+// the bubble drifting toward the raised side (smoothed live tilt). The vial
+// full-scale auto-ranges, so tiny tilts are magnified and big tilts zoom out.
+static void drawBubbleLevel(int cx, int cy, int R, float scaleDeg) {
+  auto& cv = g_canvas;
+  const uint16_t faint = 0x39C7;                     // dim grey gridlines
+  cv.drawCircle(cx, cy, R,     TFT_DARKGREY);
+  cv.drawCircle(cx, cy, R - 1, TFT_DARKGREY);
+  cv.drawCircle(cx, cy, (R * 2) / 3, faint);
+  cv.drawCircle(cx, cy, R / 3,       faint);
+  cv.drawFastHLine(cx - R, cy, 2 * R, faint);
+  cv.drawFastVLine(cx, cy - R, 2 * R, faint);
+
+  // centre "level" tolerance ring (kept visible even at the finest scale)
+  int tolR = (int)((LEVEL_TOLERANCE_DEG / scaleDeg) * R);
+  if (tolR < 7) tolR = 7;
+  cv.drawCircle(cx, cy, tolR, TFT_DARKGREEN);
+
+  // bubble position from the smoothed live tilt, clamped inside the vial
+  float nx = g_dispRoll  / scaleDeg;                 // roll  -> horizontal
+  float ny = g_dispPitch / scaleDeg;                 // pitch -> vertical
+  float rr = sqrtf(nx * nx + ny * ny);
+  if (rr > 1.0f) { nx /= rr; ny /= rr; }
+  const int br = 13;                                 // bubble radius
+  int bx = cx + (int)(nx * (R - br));
+  int by = cy - (int)(ny * (R - br));                // screen Y is down -> negate
+
+  bool level = (fabsf(g_dispPitch) <= LEVEL_TOLERANCE_DEG &&
+                fabsf(g_dispRoll)  <= LEVEL_TOLERANCE_DEG);
+  cv.fillCircle(bx, by, br, level ? TFT_GREEN : TFT_CYAN);
+  cv.drawCircle(bx, by, br, TFT_WHITE);
+  cv.fillCircle(bx - 4, by - 4, 3, TFT_WHITE);       // glossy highlight
+
+  // full-scale label just under the vial
+  char sl[16]; snprintf(sl, sizeof(sl), "+/-%.1f deg", scaleDeg);
+  cv.setTextSize(1); cv.setTextColor(TFT_WHITE);
+  cv.drawString(sl, cx - cv.textWidth(sl) / 2, cy + R + 2);
+}
+
 static void updateDisplay() {
   if (!g_useSprite) {                                // minimal fallback (no PSRAM)
     M5.Display.fillScreen(TFT_BLACK);
@@ -837,45 +947,47 @@ static void updateDisplay() {
 
   if (g_calStep != CAL_IDLE) { drawCalScreen(); cv.pushSprite(0, 0); return; }
 
-  // title + battery
+  // ---- top strip: title + battery -------------------------------------------
   cv.setTextSize(1); cv.setTextColor(TFT_CYAN);
-  cv.drawString("STATIC LEVEL LOGGER", 6, 6);
-  int bat = M5.Power.getBatteryLevel();
-  char bs[20]; snprintf(bs, sizeof(bs), "BAT %d%%%s", bat, ((int)M5.Power.isCharging() == 1) ? "+" : "");
-  cv.setTextColor(bat >= 0 && bat < 20 ? TFT_RED : TFT_WHITE);
-  cv.drawString(bs, W - 6 - cv.textWidth(bs), 6);
+  cv.drawString("BUBBLE LEVEL", 6, 4);
+  char bs[20]; snprintf(bs, sizeof(bs), "BAT %d%%%s", g_battery, g_charging ? "+" : "");
+  cv.setTextColor(g_battery >= 0 && g_battery < 20 ? TFT_RED : TFT_WHITE);
+  cv.drawString(bs, W - 6 - cv.textWidth(bs), 4);
 
-  // big angles (right-aligned values)
-  cv.setTextSize(2); cv.setTextColor(TFT_DARKGREY);
-  cv.drawString("PITCH", 8, 30);
-  cv.drawString("ROLL",  8, 70);
-  cv.setTextSize(4); cv.setTextColor(g_settled ? TFT_GREEN : TFT_ORANGE);
+  // ---- left: the live auto-ranging bubble (bullseye) level ------------------
+  float scaleDeg = bubbleFullScaleDeg();
+  drawBubbleLevel(86, 106, 84, scaleDeg);
+
+  // ---- right column: numeric pitch & roll for BOTH axes + status -----------
+  const int RX = 178;                                // settled -> precise average,
+  float showPitch = g_settled ? g_pitch : g_dispPitch; // else the live smoothed value
+  float showRoll  = g_settled ? g_roll  : g_dispRoll;
+  uint16_t valCol = g_settled ? TFT_GREEN : TFT_ORANGE;
   char v[16];
-  snprintf(v, sizeof(v), "%+.*f", ANGLE_DECIMALS, g_pitch);
-  cv.drawString(v, W - 8 - cv.textWidth(v), 24);
-  snprintf(v, sizeof(v), "%+.*f", ANGLE_DECIMALS, g_roll);
-  cv.drawString(v, W - 8 - cv.textWidth(v), 64);
+  cv.setTextSize(1); cv.setTextColor(TFT_DARKGREY); cv.drawString("PITCH", RX, 24);
+  cv.setTextSize(2); cv.setTextColor(valCol);
+  snprintf(v, sizeof(v), "%+.*f", ANGLE_DECIMALS, showPitch); cv.drawString(v, RX, 34);
+  cv.setTextSize(1); cv.setTextColor(TFT_DARKGREY); cv.drawString("ROLL", RX, 58);
+  cv.setTextSize(2); cv.setTextColor(valCol);
+  snprintf(v, sizeof(v), "%+.*f", ANGLE_DECIMALS, showRoll); cv.drawString(v, RX, 68);
 
-  // state + calibration
-  cv.setTextSize(2);
-  cv.setTextColor(g_settled ? TFT_GREEN : TFT_ORANGE);
-  cv.drawString(g_settled ? "SETTLED" : "MOVING", 8, 104);
+  cv.setTextSize(1);
+  cv.setTextColor(valCol);
+  cv.drawString(g_settled ? "SETTLED" : "MOVING", RX, 96);
   cv.setTextColor(g_calibrated ? TFT_GREEN : TFT_RED);
-  { const char* cstr = g_calibrated ? "CALIBRATED" : "UNCALIBRATED";
-    cv.drawString(cstr, W - 8 - cv.textWidth(cstr), 104); }
+  cv.drawString(g_calibrated ? "CALIBRATED" : "UNCALIBRATED", RX, 110);
+  cv.setTextColor(TFT_WHITE);
+  cv.drawString(g_wifiStatus, RX, 128);
+  char ln[40];
+  snprintf(ln, sizeof(ln), "SD:%s%s", g_sdStatus.c_str(), g_logging ? " LOG" : "");
+  cv.drawString(ln, RX, 140);
+  if (!isNan(g_imuTemp)) snprintf(ln, sizeof(ln), "EV:%lu   %.1fC",
+                                  (unsigned long)g_eventCount, g_imuTemp);
+  else                   snprintf(ln, sizeof(ln), "EV:%lu", (unsigned long)g_eventCount);
+  cv.drawString(ln, RX, 152);
+  cv.drawString(clockString(), RX, 164);
 
-  // detail lines
-  cv.setTextSize(1); cv.setTextColor(TFT_WHITE);
-  cv.drawString(String("WiFi: ") + g_wifiStatus, 8, 128);
-  cv.drawString(String("SD: ") + g_sdStatus + (g_logging ? "  [LOGGING]" : "") +
-                "    EV:" + String(g_eventCount), 8, 142);
-  char tline[48];
-  snprintf(tline, sizeof(tline), "IMU: %.1f C    %s",
-           isNan(g_imuTemp) ? 0.0f : g_imuTemp, clockString().c_str());
-  cv.drawString(tline, 8, 156);
-  if (g_logName.length()) cv.drawString(g_logName, 8, 170);
-
-  // buttons
+  // ---- buttons --------------------------------------------------------------
   drawBtn(g_btn[0], "CAL",  TFT_NAVY);
   drawBtn(g_btn[1], "MARK", TFT_DARKGREEN);
   drawBtn(g_btn[2], g_logging ? "STOP" : "LOG", g_logging ? TFT_MAROON : TFT_DARKGREEN);
@@ -895,6 +1007,9 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(200);
   Serial.println("\n=== M5Stack CoreS3 Static Level Logger ===");
+
+  g_battery  = M5.Power.getBatteryLevel();           // seed the cached gauge
+  g_charging = ((int)M5.Power.isCharging() == 1);
 
   M5.Display.setRotation(1);        // 320x240 landscape
   M5.Display.setBrightness(180);
@@ -960,14 +1075,24 @@ void loop() {
   static uint32_t lastPush = 0;
   if (now - lastPush >= WEB_PUSH_INTERVAL_MS) {
     lastPush = now;
-    if (g_ws.count() > 0) { String s; buildStatus(s); g_ws.textAll(s.c_str(), s.length()); }
+    if (g_ws.count() > 0) {
+      static char buf[768];
+      size_t n = buildStatus(buf, sizeof(buf));
+      g_ws.textAll(buf, n);
+    }
   }
 
   // 6) screen refresh
   static uint32_t lastDisp = 0;
   if (now - lastDisp >= DISPLAY_INTERVAL_MS) { lastDisp = now; updateDisplay(); }
 
-  // 7) housekeeping
+  // 7) housekeeping: cached battery read, dead-client cleanup, WiFi upkeep
+  static uint32_t lastBat = 0;
+  if (now - lastBat >= BATTERY_READ_INTERVAL_MS) {
+    lastBat = now;
+    g_battery  = M5.Power.getBatteryLevel();
+    g_charging = ((int)M5.Power.isCharging() == 1);
+  }
   static uint32_t lastClean = 0;
   if (now - lastClean >= 1000) { lastClean = now; g_ws.cleanupClients(); }
   wifiTick();

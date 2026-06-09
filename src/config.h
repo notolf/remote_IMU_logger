@@ -55,6 +55,8 @@
 #define TZ_INFO                "<+08>-8"
 // Plain offset (seconds) shown in the ISO timestamp (+08:00). Keep in sync with TZ_INFO.
 #define TZ_OFFSET_SECONDS      (8 * 3600)
+// Epoch past which the system clock is considered "really set" (2023-11-14).
+#define TIME_VALID_EPOCH       1700000000
 
 // -----------------------------------------------------------------------------
 // 5. IMU sampling & averaging  (accuracy-critical)
@@ -135,8 +137,28 @@
 // 10. Output / cadence
 // -----------------------------------------------------------------------------
 #define WEB_PUSH_INTERVAL_MS      150UL    // ~6.7 Hz live WebSocket push
-#define DISPLAY_INTERVAL_MS       200UL    // 5 Hz screen refresh
+#define DISPLAY_INTERVAL_MS       66UL     // ~15 Hz screen refresh (smooth bubble)
 #define ANGLE_DECIMALS            3        // decimal places for pitch/roll output
+
+//  The IMU temperature and the battery gauge are read over I2C far less often
+//  than the 100 Hz sample loop — cache them to keep the hot path light.
+#define TEMP_READ_INTERVAL_MS     500UL    // BMI270 die-temp poll
+#define BATTERY_READ_INTERVAL_MS  2000UL   // AXP2101 battery-gauge poll
+
+// -----------------------------------------------------------------------------
+// 10b. Bubble (bullseye) spirit-level display
+// -----------------------------------------------------------------------------
+//  The screen shows a live bubble that drifts toward the raised side, like a
+//  real bullseye level. Its full-scale (degrees at the outer ring) AUTO-RANGES:
+//  it zooms in for tiny tilts (max sensitivity) and zooms out so the bubble
+//  never leaves the vial. The chosen full-scale is printed next to it.
+#define BUBBLE_SMOOTH_ALPHA       0.18f    // EMA on the live tilt feeding the bubble
+#define LEVEL_TOLERANCE_DEG       0.10f    // within this of level -> bubble turns green
+//  Discrete auto-range steps (degrees at the rim). The smallest step that keeps
+//  the bubble inside BUBBLE_FILL_FRACTION of the vial is chosen, with hysteresis.
+#define BUBBLE_SCALE_STEPS        { 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f, 45.0f, 90.0f }
+#define BUBBLE_FILL_FRACTION      0.90f    // zoom out when tilt exceeds this * scale
+#define BUBBLE_SHRINK_FRACTION    0.55f    // zoom in  when tilt drops below this * lower step
 
 // -----------------------------------------------------------------------------
 // 11. CSV logging cadence
@@ -148,6 +170,19 @@
 #define MOVING_LOG_INTERVAL_MS    1000UL
 //  Flush/sync the file every N writes (1 = after every row -> safest vs power loss).
 #define LOG_FLUSH_EVERY           1
+
+// -----------------------------------------------------------------------------
+// 11b. Calibration capture validation (sanity-checks the operator's flip)
+// -----------------------------------------------------------------------------
+//  Before accepting a flip calibration we verify the operator actually did it:
+//    * the device was roughly flat (|az| within CAL_FLAT_TOL_G of 1 g) in BOTH
+//      captures, i.e. the Z axis was vertical, and
+//    * az barely changed between A and B (the 180 deg turn was about the
+//      VERTICAL axis, not a horizontal flip) — within CAL_VERT_TOL_G.
+//  These are loose sanity gates (not the precision path); a failure is reported
+//  and the offsets are NOT saved.
+#define CAL_FLAT_TOL_G            0.20f    // |az|-1g allowed at capture (~11 deg)
+#define CAL_VERT_TOL_G            0.05f    // |az_A - az_B| allowed across the flip
 
 // -----------------------------------------------------------------------------
 // 12. microSD (CoreS3 SPI bus — verified pins)

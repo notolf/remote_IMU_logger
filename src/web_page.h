@@ -182,7 +182,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(
     var card=$("calCard");
     if(s.calStep && s.calStep!=="idle"){
       card.classList.add("show");
-      $("calPrompt").textContent=s.calPrompt||"";
+      var pr=$("calPrompt");
+      pr.textContent=s.calPrompt||"";
+      pr.style.color=(s.calStep==="done")?(s.calError?"var(--bad)":"var(--ok)"):"var(--fg)";
       $("calBar").style.width=(s.calProgress||0)+"%";
       var capturing=(s.calStep==="capture_a"||s.calStep==="capture_b");
       $("btnCalNext").disabled=capturing;

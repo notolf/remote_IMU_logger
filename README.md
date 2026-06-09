@@ -173,7 +173,8 @@ scaling stays consistent, then rebuild.
 ### Columns
 
 ```
-timestamp_iso, millis, pitch_deg, roll_deg, ax_g, ay_g, az_g,
+timestamp_iso, millis, pitch_deg, roll_deg,
+ax_g, ay_g, az_g, ax_raw_g, ay_raw_g, az_raw_g, gx_dps, gy_dps, gz_dps,
 settled, calibrated, imu_temp_c, battery_pct, event_flag, event_label
 ```
 
@@ -183,6 +184,8 @@ settled, calibrated, imu_temp_c, battery_pct, event_flag, event_label
 | `millis` | Monotonic device uptime in ms (always valid) |
 | `pitch_deg`, `roll_deg` | Tilt in degrees, `ANGLE_DECIMALS` places. For settled rows these are the **N-sample averaged** values; for event rows while moving they are the instantaneous reading |
 | `ax_g`, `ay_g`, `az_g` | **Offset-corrected** accelerometer used for the angle (averaged when settled, instantaneous otherwise) |
+| `ax_raw_g`, `ay_raw_g`, `az_raw_g` | **Raw** accelerometer (no calibration offset) — `ax_g = ax_raw_g − offset_x`, etc. Lets you re-derive angles or re-calibrate offline |
+| `gx_dps`, `gy_dps`, `gz_dps` | **Raw** gyroscope (deg/s, latest sample) — useful for spotting vibration/disturbance in post-analysis |
 | `settled` | `1` = device was at rest ≥ dwell time (high-confidence); `0` = moving |
 | `calibrated` | `1` = stored flip-calibration applied; `0` = UNCALIBRATED |
 | `imu_temp_c` | BMI270 die temperature (for drift correlation) |
@@ -216,8 +219,34 @@ Row cadence:
 - **Gyro bias:** measured at boot (keep the device still for ~2 s) and slowly
   re-tracked while confidently at rest to follow temperature drift.
 
-All thresholds, the averaging size, the dwell, cadences, axis conventions, and
-credentials are grouped at the top of **`src/config.h`**.
+### On-device bubble level
+
+The main screen is a live **bullseye spirit level**: a bubble drifts toward the
+raised side as you tilt the device, and the numeric **pitch and roll** for both
+axes are shown beside it (green when settled/high-confidence, amber while moving).
+
+- **Auto-ranging scale** — the vial's full-scale (degrees at the outer ring)
+  adjusts automatically with hysteresis: it zooms *in* for sub-degree work (max
+  sensitivity) and zooms *out* so the bubble never leaves the vial. The current
+  full-scale (e.g. `+/-2.0 deg`) is printed under the bubble. Steps and behaviour
+  are set by `BUBBLE_SCALE_STEPS` / `BUBBLE_FILL_FRACTION` in `config.h`.
+- The bubble turns **green** when both axes are within `LEVEL_TOLERANCE_DEG` of
+  level. Its motion is lightly smoothed (`BUBBLE_SMOOTH_ALPHA`) so it is
+  responsive but steady. If the bubble drifts the "wrong" way for your mounting,
+  flip `PITCH_SIGN` / `ROLL_SIGN`.
+
+### Calibration validation
+
+The flip calibration is **sanity-checked** before it is saved: the device must
+have been roughly flat in both captures (Z vertical, `az ≈ 1 g`) and the 180°
+turn must have been about that **vertical** axis (`az` unchanged between A and B).
+If either check fails the offsets are **not** saved and the screen/web show a red
+`FAILED: …` message so you can retry. Tolerances are `CAL_FLAT_TOL_G` /
+`CAL_VERT_TOL_G`. (A uniform accelerometer scale error cancels in the `atan2`, so
+the Z offset is intentionally left at 0.)
+
+All thresholds, the averaging size, the dwell, cadences, axis conventions, the
+bubble behaviour, and credentials are grouped at the top of **`src/config.h`**.
 
 ---
 
