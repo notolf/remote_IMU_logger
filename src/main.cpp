@@ -1,17 +1,19 @@
 // =============================================================================
-//  M5Stack CoreS3 — Static Level Logger
+//  M5Stack CoreS3 — Static Level Logger (standalone / offline)
 // -----------------------------------------------------------------------------
 //  Measures static tilt (pitch & roll) to ~0.1 deg while the robot is at REST,
-//  shows it on-screen, mirrors it live to a PC browser over WiFi (WebSocket),
-//  lets the operator mark events remotely, and logs every reading to a CSV file
-//  on the microSD card.
+//  shows it live on-screen as a bubble level, lets the operator mark events with
+//  the touch buttons, and logs every reading to a CSV file on the microSD card.
+//
+//  No networking: WiFi and the web UI have been removed. The device is operated
+//  entirely from the touchscreen and the data lives on the microSD card.
 //
 //  Hardware  : M5Stack CoreS3 (ESP32-S3 / BMI270 IMU / BM8563 RTC / AXP2101 PMU)
 //  IMU       : Bosch BMI270 via M5Unified's M5.Imu abstraction (NO raw driver,
 //              NO BMM150 magnetometer). See config.h §6 for the accel-range note.
 //  Framework : Arduino + PlatformIO (board m5stack-cores3)
 //
-//  All tunable parameters live in config.h. The web page lives in web_page.h.
+//  All tunable parameters live in config.h.
 //
 //  KEY IDEAS
 //   * The device only ever measures at rest, so there is NO sensor fusion /
@@ -22,18 +24,14 @@
 // =============================================================================
 
 #include <M5Unified.h>
-#include <WiFi.h>
 #include <SPI.h>
 #include <FS.h>
 #include <SD.h>
 #include <Preferences.h>
-#include <ArduinoJson.h>
-#include <ESPAsyncWebServer.h>   // ESP32Async fork (pulls in AsyncTCP)
 #include <time.h>
 #include <math.h>
 
 #include "config.h"
-#include "web_page.h"
 
 // -----------------------------------------------------------------------------
 // RGB565 colour fallbacks — M5GFX defines these TFT_* names, but guard anyway so
@@ -82,17 +80,6 @@ enum CalStep {
   CAL_IDLE, CAL_WAIT_A, CAL_CAPTURE_A, CAL_WAIT_B, CAL_CAPTURE_B, CAL_DONE
 };
 
-// Commands handed from the async web task -> main loop (see handleWsText()).
-struct PendingCmd {
-  bool markEvent  = false;
-  bool toggleLog  = false;
-  bool calibrate  = false;
-  bool calibNext  = false;
-  bool calibCancel= false;
-  bool clearCalib = false;
-  char eventLabel[64] = {0};
-};
-
 // =============================================================================
 // Globals
 // =============================================================================
@@ -137,12 +124,6 @@ static bool    g_calError = false;                 // last calibration validatio
 static String  g_calResultMsg = "";               // shown on the CAL_DONE screen
 static Preferences g_prefs;
 
-// --- WiFi / time
-static String g_wifiStatus = "init";
-static String g_ip = "";
-static bool   g_isAP = false;
-static bool   g_ntpOk = false;
-
 // --- SD / logging
 static bool     g_sdOk = false;
 static bool     g_logging = false;
@@ -151,12 +132,6 @@ static String   g_logName = "";
 static String   g_sdStatus = "no card";
 static uint32_t g_eventCount = 0;
 static int      g_flushCounter = 0;
-
-// --- web
-static AsyncWebServer g_server(80);
-static AsyncWebSocket g_ws("/ws");
-static PendingCmd     g_cmd;
-static portMUX_TYPE   g_cmdMux = portMUX_INITIALIZER_UNLOCKED;
 
 // --- display
 static M5Canvas g_canvas(&M5.Display);
@@ -184,23 +159,12 @@ static void writeRow(bool settled, int eventFlag, const String& label);
 static void markEvent(const String& label);
 static void toggleLogging();
 static void loggingTick();
-static void setupWiFi();
-static bool startSTA();
-static void startAP();
-static void syncNtp();
-static void wifiTick();
-static void setupWeb();
-static void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType, void*, uint8_t*, size_t);
-static void handleWsText(uint8_t* data, size_t len);
-static size_t buildStatus(char* buf, size_t cap);
-static void processCommands();
 static void handleTouch();
 static void updateDisplay();
 static void computeButtonRects();
 static bool timeIsValid();
 static void isoTimestamp(char* buf, size_t n);
 static String clockString();
-static const char* calStepName();
 static int calProgress();
 static String calPrompt();
 static String csvField(const String& s);
@@ -410,16 +374,6 @@ static void calibrationTick() {
   }
 }
 
-static const char* calStepName() {
-  switch (g_calStep) {
-    case CAL_WAIT_A:   return "wait_a";
-    case CAL_CAPTURE_A:return "capture_a";
-    case CAL_WAIT_B:   return "wait_b";
-    case CAL_CAPTURE_B:return "capture_b";
-    case CAL_DONE:     return "done";
-    default:           return "idle";
-  }
-}
 static int calProgress() {
   if (g_calStep == CAL_CAPTURE_A || g_calStep == CAL_CAPTURE_B)
     return (int)(100L * g_bufCount / AVG_SAMPLES);
@@ -519,7 +473,7 @@ static void isoTimestamp(char* buf, size_t n) {
              lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
              lt.tm_hour, lt.tm_min, lt.tm_sec, sign, off / 3600, (off % 3600) / 60);
   } else {
-    snprintf(buf, n, "NO_NTP");                     // millis column is still valid
+    snprintf(buf, n, "NO_TIME");                    // RTC unset; millis is still valid
   }
 }
 static String clockString() {
@@ -530,7 +484,7 @@ static String clockString() {
              lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
     return String(b);
   }
-  return String("no NTP (") + String(millis() / 1000) + "s up)";
+  return String("no clock (") + String(millis() / 1000) + "s up)";
 }
 
 // =============================================================================
@@ -657,194 +611,46 @@ static void loggingTick() {
 }
 
 // =============================================================================
-// WiFi + NTP
+// Touch buttons (the only operator input — there is no web UI)
+// -----------------------------------------------------------------------------
+//  Normal mode buttons:  CAL (tap = start calibration, HOLD = clear calibration)
+//                        MARK (log an event row), LOG (start/stop logging).
+//  Calibration wizard:   NEXT (advance / finish), CANCEL.
 // =============================================================================
-static void startAP() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  g_isAP = true; g_ip = WiFi.softAPIP().toString();
-  g_wifiStatus = "AP " + g_ip;
-  Serial.printf("[WiFi] Soft-AP '%s' (pw '%s') up at %s\n", AP_SSID, AP_PASS, g_ip.c_str());
-}
-static bool startSTA() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  g_wifiStatus = "STA connecting";
-  Serial.printf("[WiFi] joining '%s' ...\n", WIFI_SSID);
-  // Joining can take several seconds (and the whole timeout on bad creds), so
-  // keep the live bubble on screen and responsive instead of a frozen banner.
-  uint32_t t0 = millis(), lastUi = 0;
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
-    if (g_imuOk) imuSampleTick();
-    uint32_t m = millis();
-    if (m - lastUi >= DISPLAY_INTERVAL_MS) { lastUi = m; updateDisplay(); }
-    delay(SAMPLE_INTERVAL_MS);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    g_isAP = false; g_ip = WiFi.localIP().toString();
-    g_wifiStatus = "STA " + g_ip;
-    Serial.printf("[WiFi] connected, IP %s\n", g_ip.c_str());
-    return true;
-  }
-  Serial.println("[WiFi] station connect FAILED");
-  return false;
-}
-static void syncNtp() {
-  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
-  Serial.println("[NTP] syncing...");
-  struct tm tm0; uint32_t t0 = millis(), lastUi = 0;
-  while (!getLocalTime(&tm0, 0) && millis() - t0 < 8000) {
-    if (g_imuOk) imuSampleTick();                  // keep the bubble live
-    uint32_t m = millis();
-    if (m - lastUi >= DISPLAY_INTERVAL_MS) { lastUi = m; updateDisplay(); }
-    delay(SAMPLE_INTERVAL_MS);
-  }
-  if (getLocalTime(&tm0, 100)) {
-    g_ntpOk = true;
-    Serial.printf("[NTP] OK: %04d-%02d-%02d %02d:%02d:%02d\n",
-                  tm0.tm_year + 1900, tm0.tm_mon + 1, tm0.tm_mday,
-                  tm0.tm_hour, tm0.tm_min, tm0.tm_sec);
-    // Persist UTC to the BM8563 RTC so timestamps survive an AP-only reboot.
-    time_t now = time(nullptr); struct tm utc; gmtime_r(&now, &utc);
-    m5::rtc_datetime_t dt;
-    dt.date.year = utc.tm_year + 1900; dt.date.month = utc.tm_mon + 1;
-    dt.date.date = utc.tm_mday;        dt.date.weekDay = utc.tm_wday;
-    dt.time.hours = utc.tm_hour; dt.time.minutes = utc.tm_min; dt.time.seconds = utc.tm_sec;
-    M5.Rtc.setDateTime(dt);
-  } else {
-    Serial.println("[NTP] FAILED -> using RTC/millis timestamps");
-  }
-}
-static void setupWiFi() {
-#if WIFI_MODE_SELECT == WIFI_MODE_AP
-  startAP();
-#elif WIFI_MODE_SELECT == WIFI_MODE_STA
-  if (startSTA()) syncNtp(); else g_wifiStatus = "STA failed";
-#else // WIFI_MODE_AUTO: station first, soft-AP fallback
-  if (startSTA()) syncNtp(); else startAP();
-#endif
-}
-static void wifiTick() {
-#if WIFI_MODE_SELECT != WIFI_MODE_AP
-  if (g_isAP) return;
-  static uint32_t lastChk = 0; uint32_t now = millis();
-  if (now - lastChk < WIFI_RECONNECT_INTERVAL_MS) return;
-  lastChk = now;
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] link down -> reconnect");
-    g_wifiStatus = "STA reconnecting";
-    WiFi.reconnect();
-  } else {
-    g_ip = WiFi.localIP().toString(); g_wifiStatus = "STA " + g_ip;
-    if (!g_ntpOk) syncNtp();                         // late NTP if it failed before
-  }
-#endif
-}
-
-// =============================================================================
-// Web server + WebSocket
-// =============================================================================
-static void handleWsText(uint8_t* data, size_t len) {
-  // Runs in the AsyncTCP task. Parse here, but only ever hand small flags to the
-  // main loop under a short critical section — no SD / IMU access in this context.
-  JsonDocument doc;
-  if (deserializeJson(doc, (const char*)data, len)) return;
-  const char* cmd   = doc["cmd"]   | "";
-  const char* label = doc["label"] | "";
-  portENTER_CRITICAL(&g_cmdMux);
-  if      (!strcmp(cmd, "mark_event"))  { g_cmd.markEvent = true;
-            strncpy(g_cmd.eventLabel, label, sizeof(g_cmd.eventLabel) - 1);
-            g_cmd.eventLabel[sizeof(g_cmd.eventLabel) - 1] = 0; }
-  else if (!strcmp(cmd, "toggle_log"))   g_cmd.toggleLog   = true;
-  else if (!strcmp(cmd, "calibrate"))    g_cmd.calibrate   = true;
-  else if (!strcmp(cmd, "calib_next"))   g_cmd.calibNext   = true;
-  else if (!strcmp(cmd, "calib_cancel")) g_cmd.calibCancel = true;
-  else if (!strcmp(cmd, "clear_calib"))  g_cmd.clearCalib  = true;
-  portEXIT_CRITICAL(&g_cmdMux);
-}
-static void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* c, AwsEventType type,
-                      void* arg, uint8_t* data, size_t len) {
-  if (type == WS_EVT_DATA) {
-    AwsFrameInfo* info = (AwsFrameInfo*)arg;
-    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)
-      handleWsText(data, len);
-  } else if (type == WS_EVT_CONNECT) {
-    Serial.printf("[WS] client #%u connected\n", c->id());
-  } else if (type == WS_EVT_DISCONNECT) {
-    Serial.printf("[WS] client #%u disconnected\n", c->id());
-  }
-}
-static void setupWeb() {
-  g_ws.onEvent(onWsEvent);
-  g_server.addHandler(&g_ws);
-  g_server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send_P(200, "text/html", INDEX_HTML);        // served from PROGMEM, no CDN
-  });
-  g_server.onNotFound([](AsyncWebServerRequest* r) { r->send(404, "text/plain", "not found"); });
-  g_server.begin();
-  Serial.println("[WEB] HTTP+WS server started on port 80");
-}
-static size_t buildStatus(char* buf, size_t cap) {
-  JsonDocument doc;
-  doc["type"]       = "status";
-  doc["pitch"]      = g_pitch;
-  doc["roll"]       = g_roll;
-  doc["settled"]    = g_settled;
-  doc["calibrated"] = g_calibrated;
-  doc["ax"]         = g_settled ? g_avgAx : g_instAx;
-  doc["ay"]         = g_settled ? g_avgAy : g_instAy;
-  doc["az"]         = g_settled ? g_avgAz : g_instAz;
-  if (!isNan(g_imuTemp)) doc["imu_temp"] = g_imuTemp; else doc["imu_temp"] = nullptr;
-  doc["battery"]    = g_battery;
-  doc["charging"]   = g_charging;
-  doc["events"]     = g_eventCount;
-  doc["wifi"]       = g_wifiStatus;
-  doc["logging"]    = g_logging;
-  doc["sd"]         = g_sdStatus;
-  doc["file"]       = g_logName;
-  doc["clock"]      = clockString();
-  doc["calStep"]    = calStepName();
-  doc["calPrompt"]  = calPrompt();
-  doc["calProgress"]= calProgress();
-  doc["calError"]   = g_calError;
-  return serializeJson(doc, buf, cap);          // into a fixed buffer (no heap churn)
-}
-
-// =============================================================================
-// Command dispatch (main-loop context) + touch buttons
-// =============================================================================
-static void processCommands() {
-  bool mEvent, mToggle, mCal, mNext, mCancel, mClear;
-  char label[64];
-  portENTER_CRITICAL(&g_cmdMux);
-  mEvent  = g_cmd.markEvent;  mToggle = g_cmd.toggleLog; mCal    = g_cmd.calibrate;
-  mNext   = g_cmd.calibNext;  mCancel = g_cmd.calibCancel; mClear = g_cmd.clearCalib;
-  memcpy(label, g_cmd.eventLabel, sizeof(label));
-  g_cmd.markEvent = g_cmd.toggleLog = g_cmd.calibrate = false;
-  g_cmd.calibNext = g_cmd.calibCancel = g_cmd.clearCalib = false;
-  portEXIT_CRITICAL(&g_cmdMux);
-
-  if (mEvent)  markEvent(String(label));
-  if (mToggle) toggleLogging();
-  if (mCal)    calibStart();
-  if (mNext)   calibAdvance();
-  if (mCancel) calibCancel();
-  if (mClear)  clearCalibration();
-}
 static void handleTouch() {
-  if (M5.Touch.getCount() == 0) return;
+  // Note: do NOT early-return on getCount()==0 — the release frame often reports
+  // zero active touches, and we need wasReleased() there. getDetail(0) is valid.
   auto t = M5.Touch.getDetail();
-  if (!t.wasPressed()) return;                       // act on the touch-down edge
   int x = t.x, y = t.y;
-  if (g_calStep != CAL_IDLE) {                       // calibration mode buttons
-    if      (hit(x, y, g_btnCalNext))   calibAdvance();
-    else if (hit(x, y, g_btnCalCancel)) calibCancel();
+
+  // ---- calibration wizard: act on release over a button ----------------------
+  if (g_calStep != CAL_IDLE) {
+    if (t.wasReleased()) {
+      if      (hit(x, y, g_btnCalNext))   calibAdvance();
+      else if (hit(x, y, g_btnCalCancel)) calibCancel();
+    }
     return;
   }
-  if      (hit(x, y, g_btn[0])) calibStart();        // CAL
-  else if (hit(x, y, g_btn[1])) markEvent("device-button"); // MARK
-  else if (hit(x, y, g_btn[2])) toggleLogging();     // LOG
+
+  // ---- normal mode: HOLD on CAL clears stored calibration --------------------
+  static uint32_t calHoldStart = 0;
+  static bool     calCleared   = false;
+  if (t.isPressed() && hit(x, y, g_btn[0])) {
+    if (calHoldStart == 0) { calHoldStart = millis(); calCleared = false; }
+    else if (!calCleared && millis() - calHoldStart >= CAL_CLEAR_HOLD_MS) {
+      clearCalibration();                            // revert to UNCALIBRATED
+      calCleared = true;
+    }
+  } else {
+    calHoldStart = 0;                                // released, or moved off CAL
+  }
+
+  // ---- normal mode: taps act on release --------------------------------------
+  if (t.wasReleased()) {
+    if      (hit(x, y, g_btn[0])) { if (!calCleared) calibStart(); } // CAL (tap)
+    else if (hit(x, y, g_btn[1])) markEvent("device-button");        // MARK
+    else if (hit(x, y, g_btn[2])) toggleLogging();                   // LOG
+  }
 }
 
 // =============================================================================
@@ -993,19 +799,18 @@ static void updateDisplay() {
 
   cv.setTextSize(1);
   cv.setTextColor(valCol);
-  cv.drawString(g_settled ? "SETTLED" : "MOVING", RX, 96);
+  cv.drawString(g_settled ? "SETTLED" : "MOVING", RX, 98);
   cv.setTextColor(g_calibrated ? TFT_GREEN : TFT_RED);
-  cv.drawString(g_calibrated ? "CALIBRATED" : "UNCALIBRATED", RX, 110);
+  cv.drawString(g_calibrated ? "CALIBRATED" : "UNCALIBRATED", RX, 114);
   cv.setTextColor(TFT_WHITE);
-  cv.drawString(g_wifiStatus, RX, 128);
   char ln[40];
   snprintf(ln, sizeof(ln), "SD:%s%s", g_sdStatus.c_str(), g_logging ? " LOG" : "");
-  cv.drawString(ln, RX, 140);
+  cv.drawString(ln, RX, 134);
   if (!isNan(g_imuTemp)) snprintf(ln, sizeof(ln), "EV:%lu   %.1fC",
                                   (unsigned long)g_eventCount, g_imuTemp);
   else                   snprintf(ln, sizeof(ln), "EV:%lu", (unsigned long)g_eventCount);
-  cv.drawString(ln, RX, 152);
-  cv.drawString(clockString(), RX, 164);
+  cv.drawString(ln, RX, 150);
+  cv.drawString(clockString(), RX, 166);
 
   // ---- buttons --------------------------------------------------------------
   drawBtn(g_btn[0], "CAL",  TFT_NAVY);
@@ -1056,18 +861,17 @@ void setup() {
   measureGyroBias();                // ~2 s, device must be still
   loadCalibration();                // NVS offsets (or UNCALIBRATED)
 
-  // --- clock (seed from RTC before WiFi so filenames can be timestamped) ----
+  // --- clock: use the battery-backed BM8563 RTC if it holds a valid time -----
+  //  There is no NTP (no WiFi), so timestamps are real only if the RTC was set
+  //  beforehand (e.g. by M5Burner). Otherwise filenames fall back to an index
+  //  and timestamp_iso is logged as NO_TIME — the millis column is always valid.
   setenv("TZ", TZ_INFO, 1); tzset();
   M5.Rtc.setSystemTimeFromRtc();    // no-op if the RTC was never set
-
-  // --- WiFi (station or soft-AP) + NTP --------------------------------------
-  setupWiFi();
-  setupWeb();
 
   // --- microSD: open the log file; start logging if a card is present -------
   if (openLog()) g_logging = true;
 
-  Serial.printf("[BOOT] done. Open  http://%s/  in a browser.\n", g_ip.c_str());
+  Serial.println("[BOOT] done (standalone, no networking).");
 }
 
 void loop() {
@@ -1084,38 +888,23 @@ void loop() {
   // 2) calibration capture completion
   calibrationTick();
 
-  // 3) commands from web + on-screen touch buttons
-  processCommands();
+  // 3) on-screen touch buttons (the only operator input)
   handleTouch();
 
   // 4) CSV logging cadence (settled rows; events are immediate)
   loggingTick();
 
-  // 5) live WebSocket push
-  static uint32_t lastPush = 0;
-  if (now - lastPush >= WEB_PUSH_INTERVAL_MS) {
-    lastPush = now;
-    if (g_ws.count() > 0) {
-      static char buf[768];
-      size_t n = buildStatus(buf, sizeof(buf));
-      g_ws.textAll(buf, n);
-    }
-  }
-
-  // 6) screen refresh
+  // 5) screen refresh (live bubble level)
   static uint32_t lastDisp = 0;
   if (now - lastDisp >= DISPLAY_INTERVAL_MS) { lastDisp = now; updateDisplay(); }
 
-  // 7) housekeeping: cached battery read, dead-client cleanup, WiFi upkeep
+  // 6) cached battery/charging read (kept off the 100 Hz hot path)
   static uint32_t lastBat = 0;
   if (now - lastBat >= BATTERY_READ_INTERVAL_MS) {
     lastBat = now;
     g_battery  = M5.Power.getBatteryLevel();
     g_charging = ((int)M5.Power.isCharging() == 1);
   }
-  static uint32_t lastClean = 0;
-  if (now - lastClean >= 1000) { lastClean = now; g_ws.cleanupClients(); }
-  wifiTick();
 
-  delay(1);                                          // yield to WiFi/idle tasks
+  delay(1);                                          // yield to idle task
 }

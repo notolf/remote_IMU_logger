@@ -2,11 +2,10 @@
 //  config.h  —  ALL tunable parameters for the M5Stack CoreS3 Static Level Logger
 // -----------------------------------------------------------------------------
 //  Everything you are likely to want to change lives in this one file:
-//    * WiFi / soft-AP credentials and mode
-//    * NTP / timezone
+//    * Time zone / RTC (the device is offline — no WiFi/NTP)
 //    * IMU sampling, averaging and stationary-detection thresholds
 //    * Axis / sign conventions (physical mounting is unknown -> easy to flip)
-//    * Web push rate, display rate, logging cadence
+//    * Bubble-level display behaviour, display rate, logging cadence
 //
 //  Target board : M5Stack CoreS3  (ESP32-S3, BMI270 IMU, BM8563 RTC, AXP2101 PMU)
 //  IMU          : Bosch BMI270 via M5Unified (M5.Imu). NOT MPU6886. BMM150 unused.
@@ -14,42 +13,13 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// 1. WiFi — STATION credentials (the AP you normally join)
+// 1. Time zone / RTC  (the device is OFFLINE — there is no WiFi/NTP)
 // -----------------------------------------------------------------------------
-//  Edit these two lines to match your network.
-#define WIFI_SSID              "YOUR_WIFI_SSID"
-#define WIFI_PASS              "YOUR_WIFI_PASSWORD"
-
-// How long to wait for a station connection before giving up (and, in AUTO
-// mode, falling back to the soft-AP).
-#define WIFI_CONNECT_TIMEOUT_MS   15000UL
-
-// -----------------------------------------------------------------------------
-// 2. WiFi — SOFT-AP fallback (used when the robot roams out of router range)
-// -----------------------------------------------------------------------------
-//  Connect your PC to this network, then browse to http://192.168.4.1/
-#define AP_SSID                "LevelLogger"
-#define AP_PASS                "level1234"      // must be >= 8 chars (WPA2)
-
-// -----------------------------------------------------------------------------
-// 3. WiFi mode selection
-// -----------------------------------------------------------------------------
-//  WIFI_MODE_AUTO    : try STATION first, fall back to SOFT-AP on failure  (default)
-//  WIFI_MODE_STA     : station only (no AP fallback)
-//  WIFI_MODE_AP      : soft-AP only (never try to join a router)
-#define WIFI_MODE_AUTO  0
-#define WIFI_MODE_STA   1
-#define WIFI_MODE_AP    2
-#define WIFI_MODE_SELECT   WIFI_MODE_AUTO
-
-// If a station link is up but later drops, how often to attempt a reconnect.
-#define WIFI_RECONNECT_INTERVAL_MS   10000UL
-
-// -----------------------------------------------------------------------------
-// 4. NTP / timezone  (real wall-clock timestamps; falls back to millis if no NTP)
-// -----------------------------------------------------------------------------
-#define NTP_SERVER_1           "pool.ntp.org"
-#define NTP_SERVER_2           "time.google.com"
+//  Timestamps come from the battery-backed BM8563 RTC. They are real wall-clock
+//  only if the RTC was set beforehand (e.g. M5Burner's "Set time", or a build
+//  that once had NTP). If the RTC is unset, CSV rows log NO_TIME and files use an
+//  incrementing index; the millis column is always valid either way.
+//
 // POSIX TZ string. Default: Asia/Singapore, UTC+8, no daylight saving.
 //   Examples:  Singapore "<+08>-8"   UTC "UTC0"   US-Eastern "EST5EDT,M3.2.0,M11.1.0"
 #define TZ_INFO                "<+08>-8"
@@ -136,7 +106,6 @@
 // -----------------------------------------------------------------------------
 // 10. Output / cadence
 // -----------------------------------------------------------------------------
-#define WEB_PUSH_INTERVAL_MS      150UL    // ~6.7 Hz live WebSocket push
 #define DISPLAY_INTERVAL_MS       66UL     // ~15 Hz screen refresh (smooth bubble)
 #define ANGLE_DECIMALS            3        // decimal places for pitch/roll output
 
@@ -183,6 +152,8 @@
 //  and the offsets are NOT saved.
 #define CAL_FLAT_TOL_G            0.20f    // |az|-1g allowed at capture (~11 deg)
 #define CAL_VERT_TOL_G            0.05f    // |az_A - az_B| allowed across the flip
+//  Touch-and-HOLD the on-screen CAL button this long to clear stored calibration.
+#define CAL_CLEAR_HOLD_MS         1500UL
 
 // -----------------------------------------------------------------------------
 // 12. microSD (CoreS3 SPI bus — verified pins)
