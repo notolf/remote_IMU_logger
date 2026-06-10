@@ -470,18 +470,29 @@ static void clearCalibration() {
   Serial.println("[NVS] calibration cleared -> UNCALIBRATED");
 }
 
+// Centered two-line boot/status banner (used during the blocking startup steps
+// so the screen never looks frozen before the live bubble view takes over).
+static void bootBanner(const char* l1, const char* l2, uint16_t color) {
+  if (g_useSprite) {
+    g_canvas.fillSprite(TFT_BLACK);
+    g_canvas.setTextColor(color); g_canvas.setTextSize(2);
+    g_canvas.drawString(l1, (g_canvas.width() - g_canvas.textWidth(l1)) / 2, 95);
+    if (l2 && *l2)
+      g_canvas.drawString(l2, (g_canvas.width() - g_canvas.textWidth(l2)) / 2, 125);
+    g_canvas.pushSprite(0, 0);
+  } else {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(color); M5.Display.setTextSize(2);
+    M5.Display.setCursor(16, 95);  M5.Display.print(l1);
+    if (l2 && *l2) { M5.Display.setCursor(16, 125); M5.Display.print(l2); }
+  }
+}
+
 // Measured once at boot (device must be still). Removes the BMI270 gyro bias so
 // the absolute gyro-magnitude rest threshold is meaningful.
 static void measureGyroBias() {
   if (!g_imuOk) return;
-  if (g_useSprite) {
-    g_canvas.fillSprite(TFT_BLACK);
-    g_canvas.setTextColor(TFT_YELLOW); g_canvas.setTextSize(2);
-    const char* a = "Measuring gyro bias"; const char* b = "KEEP STILL...";
-    g_canvas.drawString(a, (g_canvas.width() - g_canvas.textWidth(a)) / 2, 95);
-    g_canvas.drawString(b, (g_canvas.width() - g_canvas.textWidth(b)) / 2, 125);
-    g_canvas.pushSprite(0, 0);
-  }
+  bootBanner("Measuring gyro", "KEEP STILL...", TFT_YELLOW);
   double s[3] = {0, 0, 0}; int n = 0;
   for (int i = 0; i < GYRO_BIAS_SAMPLES; i++) {
     M5.Imu.update();
@@ -659,12 +670,17 @@ static bool startSTA() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("[WiFi] joining '%s' ...", WIFI_SSID);
-  uint32_t t0 = millis();
+  g_wifiStatus = "STA connecting";
+  Serial.printf("[WiFi] joining '%s' ...\n", WIFI_SSID);
+  // Joining can take several seconds (and the whole timeout on bad creds), so
+  // keep the live bubble on screen and responsive instead of a frozen banner.
+  uint32_t t0 = millis(), lastUi = 0;
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(200); Serial.print('.');
+    if (g_imuOk) imuSampleTick();
+    uint32_t m = millis();
+    if (m - lastUi >= DISPLAY_INTERVAL_MS) { lastUi = m; updateDisplay(); }
+    delay(SAMPLE_INTERVAL_MS);
   }
-  Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
     g_isAP = false; g_ip = WiFi.localIP().toString();
     g_wifiStatus = "STA " + g_ip;
@@ -676,10 +692,14 @@ static bool startSTA() {
 }
 static void syncNtp() {
   configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
-  Serial.print("[NTP] syncing");
-  struct tm tm0; uint32_t t0 = millis();
-  while (!getLocalTime(&tm0, 500) && millis() - t0 < 8000) Serial.print('.');
-  Serial.println();
+  Serial.println("[NTP] syncing...");
+  struct tm tm0; uint32_t t0 = millis(), lastUi = 0;
+  while (!getLocalTime(&tm0, 0) && millis() - t0 < 8000) {
+    if (g_imuOk) imuSampleTick();                  // keep the bubble live
+    uint32_t m = millis();
+    if (m - lastUi >= DISPLAY_INTERVAL_MS) { lastUi = m; updateDisplay(); }
+    delay(SAMPLE_INTERVAL_MS);
+  }
   if (getLocalTime(&tm0, 100)) {
     g_ntpOk = true;
     Serial.printf("[NTP] OK: %04d-%02d-%02d %02d:%02d:%02d\n",
