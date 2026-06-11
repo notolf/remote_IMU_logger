@@ -648,9 +648,11 @@ external reference — not included in this report's scope.</li>
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def pick_files_dialog():
-    """Native file picker for argument-less launches (double-click, IDE 'Run').
-    Returns [] when unavailable (headless) or cancelled."""
+# --- file selection for argument-less launches (IDE 'Run', double-click) -----
+# Three mechanisms, tried in order. Each returns None when the MECHANISM is
+# unavailable (try the next one) and [] when the USER cancelled (stop asking).
+
+def _pick_tkinter():
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -658,13 +660,74 @@ def pick_files_dialog():
         root.withdraw()
         root.update()
         files = filedialog.askopenfilenames(
-            title="Select level_log CSV file(s)",
+            title="Select level_log CSV file(s)", initialdir=os.getcwd(),
             filetypes=[("Level logger CSV", "level_log_*.csv"),
                        ("CSV files", "*.csv"), ("All files", "*.*")])
         root.destroy()
         return list(files)
     except Exception:
+        return None                       # tkinter missing/headless -> next mechanism
+
+
+def _pick_powershell():
+    """Native Windows open-file dialog without tkinter (System.Windows.Forms)."""
+    if sys.platform != "win32":
+        return None
+    ps = ("Add-Type -AssemblyName System.Windows.Forms;"
+          "$d=New-Object System.Windows.Forms.OpenFileDialog;"
+          "$d.Multiselect=$true;"
+          "$d.InitialDirectory='" + os.getcwd().replace("'", "''") + "';"
+          "$d.Filter='Level logger CSV (level_log_*.csv)|level_log_*.csv"
+          "|CSV files (*.csv)|*.csv|All files (*.*)|*.*';"
+          "$d.Title='Select level_log CSV file(s)';"
+          "if($d.ShowDialog() -eq 'OK'){$d.FileNames -join [Environment]::NewLine}")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+                             capture_output=True, text=True, timeout=600)
+        if out.returncode != 0:
+            return None
+        return [l.strip() for l in out.stdout.splitlines() if l.strip()]
+    except Exception:
+        return None
+
+
+def _pick_console():
+    """Last resort: list level_log_*.csv found near the script / cwd and let
+    the user pick by number, or type a path. Works everywhere, even over SSH."""
+    import glob
+    here = os.path.dirname(os.path.abspath(__file__))
+    dirs = [os.getcwd(), here, os.path.dirname(here)]
+    cands, seen = [], set()
+    for d in dirs:
+        for f in sorted(glob.glob(os.path.join(d, "level_log_*.csv"))):
+            rp = os.path.realpath(f)
+            if rp not in seen:
+                seen.add(rp)
+                cands.append(f)
+    try:
+        if not cands:
+            path = input("Path to a level_log CSV: ").strip().strip('"')
+            return [path] if path else []
+        print("\nFound log files:")
+        for i, c in enumerate(cands, 1):
+            print(f"  [{i}] {c}  ({os.path.getsize(c)//1024} KB)")
+        sel = input("Select number(s), comma-separated — or type a path: ").strip()
+        if not sel:
+            return []
+        if all(p.strip().isdigit() for p in sel.split(",")):
+            idx = [int(p) for p in sel.split(",")]
+            return [cands[i - 1] for i in idx if 1 <= i <= len(cands)]
+        return [sel.strip('"')]
+    except EOFError:
         return []
+
+
+def pick_files_dialog():
+    for mech in (_pick_tkinter, _pick_powershell):
+        r = mech()
+        if r is not None:                 # mechanism worked ([] = user cancelled)
+            return r
+    return _pick_console()
 
 
 def main():
