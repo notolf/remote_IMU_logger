@@ -648,9 +648,29 @@ external reference — not included in this report's scope.</li>
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+def pick_files_dialog():
+    """Native file picker for argument-less launches (double-click, IDE 'Run').
+    Returns [] when unavailable (headless) or cancelled."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        files = filedialog.askopenfilenames(
+            title="Select level_log CSV file(s)",
+            filetypes=[("Level logger CSV", "level_log_*.csv"),
+                       ("CSV files", "*.csv"), ("All files", "*.*")])
+        root.destroy()
+        return list(files)
+    except Exception:
+        return []
+
+
 def main():
     ap = argparse.ArgumentParser(description="Evaluate Static Level Logger CSVs into an HTML report.")
-    ap.add_argument("logs", nargs="+", help="level_log_*.csv file(s)")
+    ap.add_argument("logs", nargs="*", help="level_log_*.csv file(s); "
+                    "omit to choose via a file dialog")
     ap.add_argument("-o", "--out", help="output HTML path")
     ap.add_argument("--all", action="store_true", help="whole log as one selection (no GUI)")
     ap.add_argument("--reuse", action="store_true", help="reuse saved selections (no GUI)")
@@ -658,6 +678,16 @@ def main():
     ap.add_argument("--include-moving", action="store_true",
                     help="include settled=0 rows in statistics (default: settled only)")
     args = ap.parse_args()
+
+    from_picker = False
+    if not args.logs:                      # launched without arguments (IDE/double-click)
+        print("No log file given — opening a file picker ...")
+        args.logs = pick_files_dialog()
+        from_picker = bool(args.logs)
+        if not args.logs:
+            ap.print_help()
+            raise SystemExit("\nNo log selected. Pass the CSV path, e.g.:\n"
+                             "  python tools/evaluate_level_log.py level_log_0001.csv")
 
     df, sessions = load_logs(args.logs)
     dwells = segment_dwells(df)
@@ -701,6 +731,9 @@ def main():
     open(out, "w", encoding="utf-8").write(
         build_report(args, df, sessions, dwells, ranges, results, imgs, allan_info))
     print(f"Report written: {out}")
+    if from_picker:                        # GUI-launched -> show the result directly
+        import webbrowser
+        webbrowser.open("file://" + os.path.abspath(out))
 
     for k, r in enumerate(results):                      # console summary
         if r.get("valid"):
