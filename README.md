@@ -26,6 +26,7 @@ the data of record; the dashboard is live telemetry plus remote control.
 | `src/config.h`   | **All tunable parameters** (WiFi, timezone, thresholds, axes, bubble, cadences) |
 | `src/main.cpp`   | Firmware: IMU, stationary detection, calibration, bubble display, SD logging, WiFi + JSON API |
 | `src/web_page.h` | The embedded phone dashboard (single self-contained HTML page, NOVA design tokens) |
+| `tools/evaluate_level_log.py` | Offline evaluation of the CSV logs → self-contained HTML report |
 
 ---
 
@@ -275,7 +276,52 @@ Row cadence:
 
 ---
 
-## 7. How it works (brief)
+## 7. Evaluate the data → HTML report (Python)
+
+`tools/evaluate_level_log.py` turns the CSV logs into a self-contained HTML
+report (NOVA-styled, embedded plots — print to PDF from the browser).
+
+```bash
+pip install numpy pandas matplotlib
+python tools/evaluate_level_log.py level_log_20260611_103000.csv
+```
+
+A time-series window opens: **drag** horizontally (on the pitch or roll plot)
+to select one or more ranges of measurement points — `u` undo, `r` reset,
+`a` whole log, `ENTER` done. Selections are saved next to the log as
+`<log>.selections.json`, so the identical report can be regenerated headlessly
+with `--reuse`. `--all` skips the GUI and evaluates the whole log; multiple
+CSVs can be given and are concatenated.
+
+What the report contains:
+
+- **Session metadata** — files, time span, dwell count, IMU temperature range,
+  and the **calibration offsets recovered from the data itself**
+  (`raw − corrected` per axis), flagging if the calibration state changed
+  mid-log.
+- **Time series** (pitch, roll, temperature) with settled periods shaded,
+  selections highlighted, events flagged.
+- **2-D tilt plot** — every settled sample in the selection, dwell means,
+  selection means with 1σ/2σ confidence ellipses, and the ±0.1° target circle.
+  Primary axes in degrees; secondary axes in **µm of displacement across the
+  plate** (145 mm along pitch, 100 mm along roll — set at the top of the
+  script).
+- **Selection statistics** — mean, σ, peak-to-peak, min/max, drift (m°/min),
+  each also converted to µm on the plate; between-dwell **repeatability** when
+  a selection contains several dwells (re-place the plate several times to
+  measure mounting repeatability).
+- **Allan deviation** from the longest contiguous settled run — stability vs
+  averaging time, with the noise floor annotated. Note the logged rows are
+  already overlapping window averages (≈ 5 s default), so read the curve for
+  τ above the firmware averaging window.
+
+Scope note: the report quantifies **precision** (noise, drift, repeatability).
+Judging the **absolute zero** requires a flip measurement (0°/180° pair)
+against the granite plate — the same principle as the on-device calibration.
+
+---
+
+## 8. How it works (brief)
 
 - **Sampling:** the accelerometer + gyro are read at `IMU_SAMPLE_RATE_HZ`
   (100 Hz) on a non-blocking `millis()` schedule.
