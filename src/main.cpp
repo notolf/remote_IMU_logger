@@ -117,9 +117,12 @@ static Settings g_set;
 
 // --- N-sample averaging ring buffer (only ever holds *consecutive* rest samples)
 //     Sized for the compile-time maximum; the live window is g_set.avgSamples.
+//     Sum-of-squares is kept alongside the sums so the per-axis std-dev over
+//     the window is O(1) — used to validate calibration capture quality.
 static float  g_bufAx[MAX_AVG_SAMPLES], g_bufAy[MAX_AVG_SAMPLES], g_bufAz[MAX_AVG_SAMPLES];
 static int    g_bufHead = 0, g_bufCount = 0;
 static double g_sumAx = 0, g_sumAy = 0, g_sumAz = 0;
+static double g_sumSqAx = 0, g_sumSqAy = 0, g_sumSqAz = 0;
 
 // --- short window of |a| used for the accel "quiet" test
 static float  g_magWin[STATIONARY_WINDOW_SAMPLES];
@@ -154,6 +157,9 @@ static float   g_offX = 0, g_offY = 0, g_offZ = 0;
 static float   g_calTempC = NAN;                   // IMU temp when cal was captured
 static CalStep g_calStep = CAL_IDLE;
 static float   g_calA[3] = {0,0,0}, g_calB[3] = {0,0,0};
+static float   g_calStdA = 0, g_calStdB = 0;       // capture noise (worst X/Y axis std, g)
+static float   g_calTempA = NAN, g_calTempB = NAN; // IMU temp at each capture
+static int     g_calRetries = 0;                   // auto-recaptures of the current step
 static bool    g_calError = false;                 // last calibration validation failed
 static String  g_calResultMsg = "";               // shown on the CAL_DONE screen
 static Preferences g_prefs;
@@ -264,20 +270,33 @@ static void anglesFromCorrected(float ax, float ay, float az, float* p, float* r
 // =============================================================================
 // Ring-buffer helpers (N-sample average) and |a| window (stationary test)
 // =============================================================================
-static void bufReset() { g_bufHead = 0; g_bufCount = 0; g_sumAx = g_sumAy = g_sumAz = 0; }
+static void bufReset() {
+  g_bufHead = 0; g_bufCount = 0;
+  g_sumAx = g_sumAy = g_sumAz = 0;
+  g_sumSqAx = g_sumSqAy = g_sumSqAz = 0;
+}
 static void bufAdd(float ax, float ay, float az) {
   // The live window is g_set.avgSamples; any runtime change to it goes through
   // bufReset() (enforced in the settings handler), so head/count stay coherent.
   if (g_bufCount >= g_set.avgSamples) {            // full -> subtract oldest
-    g_sumAx -= g_bufAx[g_bufHead];
-    g_sumAy -= g_bufAy[g_bufHead];
-    g_sumAz -= g_bufAz[g_bufHead];
+    float ox = g_bufAx[g_bufHead], oy = g_bufAy[g_bufHead], oz = g_bufAz[g_bufHead];
+    g_sumAx -= ox;                g_sumAy -= oy;                g_sumAz -= oz;
+    g_sumSqAx -= (double)ox * ox; g_sumSqAy -= (double)oy * oy; g_sumSqAz -= (double)oz * oz;
   } else {
     g_bufCount++;
   }
   g_bufAx[g_bufHead] = ax; g_bufAy[g_bufHead] = ay; g_bufAz[g_bufHead] = az;
-  g_sumAx += ax; g_sumAy += ay; g_sumAz += az;
+  g_sumAx += ax;                g_sumAy += ay;                g_sumAz += az;
+  g_sumSqAx += (double)ax * ax; g_sumSqAy += (double)ay * ay; g_sumSqAz += (double)az * az;
   g_bufHead = (g_bufHead + 1) % g_set.avgSamples;
+}
+// Per-axis standard deviation over the current buffer window, from the running
+// sums. Doubles keep the catastrophic cancellation harmless at |a| ~ 1 g.
+static float bufAxisStd(double sum, double sumSq) {
+  if (g_bufCount < 2) return 0;
+  double mean = sum / g_bufCount;
+  double var  = sumSq / g_bufCount - mean * mean;
+  return var > 0 ? sqrtf((float)var) : 0;
 }
 
 static void magReset() { g_magHead = 0; g_magCount = 0; g_magSum = 0; g_magSumSq = 0; }
@@ -349,10 +368,6 @@ static void imuSampleTick() {
   g_instAx = ax - g_offX; g_instAy = ay - g_offY; g_instAz = az - g_offZ;
   anglesFromCorrected(g_instAx, g_instAy, g_instAz, &g_instPitch, &g_instRoll);
 
-  // Smoothed live tilt that drives the on-screen bubble: responsive yet steady.
-  g_dispPitch += BUBBLE_SMOOTH_ALPHA * (g_instPitch - g_dispPitch);
-  g_dispRoll  += BUBBLE_SMOOTH_ALPHA * (g_instRoll  - g_dispRoll);
-
   // ---- rest gating + N-sample average ----------------------------------------
   bool instStationary = gyroQuiet && accelQuiet;
   if (instStationary) {
@@ -372,6 +387,17 @@ static void imuSampleTick() {
     bufReset();
     g_settled = false;
   }
+
+  // ---- adaptive display smoothing (DISPLAY ONLY — never touches the CSV) -----
+  // At rest the bubble tracks the sharpening buffer average with a slow EMA, so
+  // it sits rock-steady instead of twitching with single-sample noise; the
+  // moment motion is detected it follows the instantaneous tilt with a fast
+  // EMA so it never feels laggy.
+  float tgtP, tgtR, alpha;
+  if (instStationary) { tgtP = g_pitch;     tgtR = g_roll;     alpha = BUBBLE_ALPHA_REST; }
+  else                { tgtP = g_instPitch; tgtR = g_instRoll; alpha = BUBBLE_ALPHA_MOVING; }
+  g_dispPitch += alpha * (tgtP - g_dispPitch);
+  g_dispRoll  += alpha * (tgtR - g_dispRoll);
 }
 
 // =============================================================================
@@ -390,31 +416,66 @@ static void imuSampleTick() {
 //  it); a Z-up/Z-down scale calibration is left as an optional extension and
 //  g_offZ stays 0 by default.
 // =============================================================================
-static void calibStart()   { g_calStep = CAL_WAIT_A; Serial.println("[CAL] started"); }
+static void calibStart()   { g_calStep = CAL_WAIT_A; g_calRetries = 0;
+                             Serial.println("[CAL] started"); }
 static void calibCancel()  { g_calStep = CAL_IDLE; bufReset(); magReset();
                              g_stationaryStreak = 0; Serial.println("[CAL] cancelled"); }
 
 static void calibAdvance() {                          // "Next" / "Finish" button
   switch (g_calStep) {
     case CAL_WAIT_A:
-      bufReset(); magReset(); g_stationaryStreak = 0; g_calStep = CAL_CAPTURE_A; break;
+      bufReset(); magReset(); g_stationaryStreak = 0; g_calRetries = 0;
+      g_calStep = CAL_CAPTURE_A; break;
     case CAL_WAIT_B:
-      bufReset(); magReset(); g_stationaryStreak = 0; g_calStep = CAL_CAPTURE_B; break;
+      bufReset(); magReset(); g_stationaryStreak = 0; g_calRetries = 0;
+      g_calStep = CAL_CAPTURE_B; break;
     case CAL_DONE:
       g_calStep = CAL_IDLE; break;
     default: break;                                   // ignored while capturing
   }
 }
 
+// Capture-quality gate: the per-axis std over the FULL window must be quiet.
+// The instantaneous stationary gate only sees a 0.25 s magnitude window, so
+// slow creep (cooling plate, settling foam feet) can sneak past it — this
+// catches that, restarts the capture automatically, and hard-fails after the
+// retry cap instead of silently saving a poor offset.
+// Returns true when the capture was accepted.
+static bool calCaptureAccept(const char* which, float* stdOut, float* tempOut) {
+  float sx = bufAxisStd(g_sumAx, g_sumSqAx);
+  float sy = bufAxisStd(g_sumAy, g_sumSqAy);
+  float stdMax = fmaxf(sx, sy);                     // offsets are X/Y — gate those axes
+  if (stdMax > CAL_MAX_STD_G) {
+    if (++g_calRetries <= CAL_MAX_RECAPTURES) {
+      Serial.printf("[CAL] capture %s noisy (std %.4f g) -> recapture %d/%d\n",
+                    which, stdMax, g_calRetries, CAL_MAX_RECAPTURES);
+      bufReset(); g_stationaryStreak = 0;           // stay in the same capture step
+      return false;
+    }
+    g_calError = true;
+    g_calResultMsg = "FAILED: too much vibration/drift during capture. "
+                     "Check the surface and retry.";
+    g_calStep = CAL_DONE;
+    return false;
+  }
+  *stdOut = stdMax;
+  *tempOut = g_imuTemp;
+  g_calRetries = 0;
+  return true;
+}
+
 static void calibrationTick() {
   // A capture/B capture complete once a full clean N-sample window is collected.
   if (g_calStep == CAL_CAPTURE_A && g_bufCount >= g_set.avgSamples) {
+    if (!calCaptureAccept("A", &g_calStdA, &g_calTempA)) return;
     g_calA[0] = (float)(g_sumAx / g_bufCount);
     g_calA[1] = (float)(g_sumAy / g_bufCount);
     g_calA[2] = (float)(g_sumAz / g_bufCount);
-    Serial.printf("[CAL] A = %.5f %.5f %.5f\n", g_calA[0], g_calA[1], g_calA[2]);
+    Serial.printf("[CAL] A = %.5f %.5f %.5f (std %.4f g, %.1f C)\n",
+                  g_calA[0], g_calA[1], g_calA[2], g_calStdA, g_calTempA);
     g_calStep = CAL_WAIT_B;
   } else if (g_calStep == CAL_CAPTURE_B && g_bufCount >= g_set.avgSamples) {
+    if (!calCaptureAccept("B", &g_calStdB, &g_calTempB)) return;
     g_calB[0] = (float)(g_sumAx / g_bufCount);
     g_calB[1] = (float)(g_sumAy / g_bufCount);
     g_calB[2] = (float)(g_sumAz / g_bufCount);
@@ -434,17 +495,40 @@ static void calibrationTick() {
       g_calResultMsg = "FAILED: not a 180 deg turn about the VERTICAL axis.";
     } else {
       // flip/reversal: (A+B)/2 cancels residual plate tilt and isolates the
-      // sensor offset. Z is left at 0 — a uniform scale cancels in the atan2.
+      // sensor offset. Z is left at 0 (it cannot be separated by a rotation
+      // about the vertical axis; near level it only contributes a tiny scale
+      // error, negligible at the 0.1 deg target).
       g_offX = (g_calA[0] + g_calB[0]) * 0.5f;
       g_offY = (g_calA[1] + g_calB[1]) * 0.5f;
       g_offZ = 0.0f;
       g_calibrated = true;
       g_calError = false;
-      g_calResultMsg = "Calibration complete and saved to NVS.";
       saveCalibration();
+
+      // Report what the calibration is worth: offset = (meanA+meanB)/2, so its
+      // 1-sigma uncertainty from capture noise is sqrt(stdA^2+stdB^2)/(2*sqrtN).
+      // Near level, 1 mg of offset is ~0.0573 deg of angle.
+      float sigMg  = 1000.0f * sqrtf(g_calStdA * g_calStdA + g_calStdB * g_calStdB)
+                     / (2.0f * sqrtf((float)g_set.avgSamples));
+      float sigDeg = sigMg * 0.0573f;
+      char m[180];
+      snprintf(m, sizeof(m),
+               "Saved. offX %+0.2f / offY %+0.2f mg, est. uncertainty "
+               "+/-%.2f mg (+/-%.3f deg).",
+               g_offX * 1000.0f, g_offY * 1000.0f, sigMg, sigDeg);
+      g_calResultMsg = m;
+      if (!isNan(g_calTempA) && !isNan(g_calTempB) &&
+          fabsf(g_calTempB - g_calTempA) > CAL_TEMP_WARN_C) {
+        snprintf(m, sizeof(m),
+                 " NOTE: IMU temp moved %.1f C between captures - thermal "
+                 "drift may bias the offsets; redo after warm-up if in doubt.",
+                 g_calTempB - g_calTempA);
+        g_calResultMsg += m;
+      }
     }
-    Serial.printf("[CAL] B = %.5f %.5f %.5f -> %s (offX=%.5f offY=%.5f)\n",
-                  g_calB[0], g_calB[1], g_calB[2],
+    Serial.printf("[CAL] B = %.5f %.5f %.5f (std %.4f g, %.1f C) -> %s "
+                  "(offX=%.5f offY=%.5f)\n",
+                  g_calB[0], g_calB[1], g_calB[2], g_calStdB, g_calTempB,
                   g_calError ? "REJECTED" : "OK", g_offX, g_offY);
     g_calStep = CAL_DONE;
   }
@@ -467,13 +551,15 @@ static const char* calStepName() {                   // for the JSON API
   }
 }
 static String calPrompt() {
+  String retry = g_calRetries
+    ? String(" (restarted ") + g_calRetries + "x: vibration/drift)" : String("");
   switch (g_calStep) {
     case CAL_WAIT_A:    return "Step 1/2: Place the device FLAT on the granite plate "
                                "(orientation A). Hold still, then press Next.";
-    case CAL_CAPTURE_A: return "Capturing orientation A - keep absolutely still...";
+    case CAL_CAPTURE_A: return "Capturing orientation A - keep absolutely still..." + retry;
     case CAL_WAIT_B:    return "Step 2/2: Rotate 180 deg about the VERTICAL axis, same "
                                "spot. Hold still, then press Next.";
-    case CAL_CAPTURE_B: return "Capturing orientation B - keep absolutely still...";
+    case CAL_CAPTURE_B: return "Capturing orientation B - keep absolutely still..." + retry;
     case CAL_DONE:      return g_calResultMsg + " Press Finish to exit.";
     default:            return "";
   }
@@ -947,8 +1033,8 @@ static String buildStatusJson() {
            g_calibrated ? 1 : 0, g_offX, g_offY);
   j += t;
   j += isNan(g_calTempC) ? String("null") : String(g_calTempC, 1);
-  snprintf(t, sizeof(t), ",\"cs\":\"%s\",\"cp\":%d,\"ce\":%d,\"cm\":\"",
-           calStepName(), calProgress(), g_calError ? 1 : 0);
+  snprintf(t, sizeof(t), ",\"cs\":\"%s\",\"cp\":%d,\"ce\":%d,\"cr\":%d,\"cm\":\"",
+           calStepName(), calProgress(), g_calError ? 1 : 0, g_calRetries);
   j += t;
   jsonEscapeInto(j, g_calResultMsg.c_str());
   j += "\",\"temp\":";
@@ -1347,10 +1433,10 @@ static void updateDisplay() {
   float showRoll  = g_settled ? g_roll  : g_dispRoll;
   uint16_t valCol = g_settled ? TFT_GREEN : TFT_ORANGE;
   char v[16];
-  cv.setTextSize(1); cv.setTextColor(TFT_DARKGREY); cv.drawString("PITCH", RX, 24);
+  cv.setTextSize(1); cv.setTextColor(TFT_DARKGREY); cv.drawString("PITCH  deg", RX, 24);
   cv.setTextSize(2); cv.setTextColor(valCol);
   snprintf(v, sizeof(v), "%+.*f", ANGLE_DECIMALS, showPitch); cv.drawString(v, RX, 34);
-  cv.setTextSize(1); cv.setTextColor(TFT_DARKGREY); cv.drawString("ROLL", RX, 58);
+  cv.setTextSize(1); cv.setTextColor(TFT_DARKGREY); cv.drawString("ROLL   deg", RX, 58);
   cv.setTextSize(2); cv.setTextColor(valCol);
   snprintf(v, sizeof(v), "%+.*f", ANGLE_DECIMALS, showRoll); cv.drawString(v, RX, 68);
 

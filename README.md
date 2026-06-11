@@ -196,6 +196,16 @@ reading_B = −g·sin(tilt) + offset      →      (A + B) / 2 = offset
   **vertical** axis (`az` unchanged A↔B). If a check fails the offsets are **not**
   saved and a red `FAILED: …` is shown so you can retry. Tolerances are
   `CAL_FLAT_TOL_G` / `CAL_VERT_TOL_G`.
+- **Capture quality gates:** the per-axis std-dev over the *whole* captured
+  window must stay below `CAL_MAX_STD_G` — slow creep or vibration that sneaks
+  past the instantaneous stationary gate **restarts the capture automatically**
+  (shown on screen and dashboard), and hard-fails after `CAL_MAX_RECAPTURES`
+  rather than silently saving a poor offset. The IMU temperature is recorded at
+  both captures; if it moved more than `CAL_TEMP_WARN_C` between A and B, the
+  result carries a **thermal-drift warning**.
+- **Known worth:** the success message reports the offsets *and their estimated
+  1σ uncertainty* from the capture noise, e.g.
+  `Saved. offX −1.23 / offY +0.45 mg, est. uncertainty ±0.05 mg (±0.003 deg).`
 - Offsets are **persisted in NVS** and reloaded on boot. With no stored
   calibration the device runs at zero offset and clearly shows **UNCALIBRATED**.
 - **Re-run** any time. **Clear** stored calibration by **holding** CAL ~1.5 s on
@@ -303,9 +313,16 @@ The top strip shows the WiFi address and opens the connect-QR when tapped.
   full-scale (e.g. `+/-2.0 deg`) is printed under the bubble. Steps and behaviour
   are set by `BUBBLE_SCALE_STEPS` / `BUBBLE_FILL_FRACTION` in `config.h`.
 - The bubble turns **green** when both axes are within the level tolerance.
-  Its motion is lightly smoothed (`BUBBLE_SMOOTH_ALPHA`) so it is responsive but
-  steady. If the bubble drifts the "wrong" way for your mounting, flip the
-  pitch/roll signs in the dashboard Settings panel.
+  Its smoothing is **adaptive** (display only — the measurement/CSV path is
+  untouched): at rest it tracks the sharpening N-sample average with a slow EMA
+  (`BUBBLE_ALPHA_REST`, rock steady), and the moment motion is detected it
+  follows the live tilt with a fast EMA (`BUBBLE_ALPHA_MOVING`, no lag).
+- **Axis orientation:** the CoreS3's BMI270 is mounted with its X axis along
+  the screen's long edge, so the pitch/roll **swap is on by default** — "pitch"
+  is raising the top/bottom edge (bubble moves vertically), "roll" the
+  left/right edge. Bench check: the bubble must drift **toward the raised
+  edge**; if it mirrors on either axis, flip `PITCH_SIGN`/`ROLL_SIGN` live in
+  the dashboard Settings panel.
 
 ---
 

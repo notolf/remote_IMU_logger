@@ -430,7 +430,10 @@ function render(){
       wait_b:'Step 2/2 — rotate 180° about the VERTICAL axis, same spot. Hold still, then press NEXT.',
       cap_b:'Capturing orientation B — keep absolutely still…',
       done:st.cm};
-    $('calprompt').textContent=prompts[st.cs]||'';
+    let ptxt=prompts[st.cs]||'';
+    if(st.cr&&(st.cs==='cap_a'||st.cs==='cap_b'))
+      ptxt+=' (restarted '+st.cr+'× — vibration/drift detected)';
+    $('calprompt').textContent=ptxt;
     $('calprog').style.width=st.cp+'%';
     const capturing=st.cs==='cap_a'||st.cs==='cap_b';
     $('calnext').disabled=capturing;

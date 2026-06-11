@@ -156,16 +156,20 @@
 // -----------------------------------------------------------------------------
 // 9. Tilt axis / sign convention  (physical mounting on the robot is UNKNOWN)
 // -----------------------------------------------------------------------------
-//  Convention (device flat, screen up, az ~ +1 g):
-//      pitch = atan2( ax, sqrt(ay^2 + az^2) ) * 180/PI    (nose up/down about Y)
-//      roll  = atan2( ay, sqrt(ax^2 + az^2) ) * 180/PI    (left/right about X)
-//  Flip a sign if the robot reports the opposite polarity; swap if the two axes
-//  are exchanged for your mounting. The swap is applied FIRST, then the signs
-//  flip the final displayed pitch/roll. All three are runtime-tunable from the
-//  dashboard Settings panel. (defaults)
+//  Raw axis angles:
+//      angX = atan2( ax, sqrt(ay^2 + az^2) ) * 180/PI   (inclination of IMU X)
+//      angY = atan2( ay, sqrt(ax^2 + az^2) ) * 180/PI   (inclination of IMU Y)
+//  On the CoreS3 the BMI270 is mounted with its X axis along the SCREEN'S LONG
+//  (horizontal, landscape) edge, and M5Unified applies no accel/gyro remap for
+//  this board (IMU_Class.cpp only flips the magnetometer). "Pitch" must mean
+//  raising the top/bottom edge (bubble moves vertically), so the swap is ON by
+//  default: pitch <- angY, roll <- angX. Bench check: the bubble must drift
+//  TOWARD the raised edge — if it mirrors, flip the sign(s) below or live in
+//  the dashboard Settings panel. Swap is applied FIRST, then the signs flip
+//  the final displayed pitch/roll. (defaults; all three runtime-tunable)
 #define PITCH_SIGN     (+1.0f)
 #define ROLL_SIGN      (+1.0f)
-#define SWAP_PITCH_ROLL   false
+#define SWAP_PITCH_ROLL   true
 
 // -----------------------------------------------------------------------------
 // 10. Output / cadence
@@ -185,7 +189,13 @@
 //  real bullseye level. Its full-scale (degrees at the outer ring) AUTO-RANGES:
 //  it zooms in for tiny tilts (max sensitivity) and zooms out so the bubble
 //  never leaves the vial. The chosen full-scale is printed next to it.
-#define BUBBLE_SMOOTH_ALPHA       0.18f    // EMA on the live tilt feeding the bubble
+//
+//  Display smoothing is ADAPTIVE (display only — the measurement/CSV path is
+//  untouched): while the device is at rest the bubble follows the sharpening
+//  N-sample average with a slow EMA (rock steady); the instant motion is seen
+//  it follows the live tilt with a fast EMA (responsive).
+#define BUBBLE_ALPHA_MOVING       0.25f    // EMA while moving: track quickly
+#define BUBBLE_ALPHA_REST         0.04f    // EMA at rest: steady (~0.25 s tau)
 #define LEVEL_TOLERANCE_DEG       0.10f    // within this of level -> green (default)
 //  Discrete auto-range steps (degrees at the rim). The smallest step that keeps
 //  the bubble inside BUBBLE_FILL_FRACTION of the vial is chosen, with hysteresis.
@@ -217,6 +227,20 @@
 //  and the offsets are NOT saved.
 #define CAL_FLAT_TOL_G            0.20f    // |az|-1g allowed at capture (~11 deg)
 #define CAL_VERT_TOL_G            0.05f    // |az_A - az_B| allowed across the flip
+//
+//  Capture QUALITY gates (accuracy hardening):
+//   * the per-axis std-dev over the whole captured window must stay below
+//     CAL_MAX_STD_G — slow creep/vibration that sneaks past the instantaneous
+//     stationary gate restarts the capture automatically (up to the retry cap,
+//     then the calibration fails rather than silently saving a poor offset);
+//   * the IMU temperature is recorded at both captures — if it moved more than
+//     CAL_TEMP_WARN_C between A and B, the result message carries a thermal-
+//     drift warning (the BMI270 zero-g offset is temperature dependent);
+//   * the result message reports the estimated offset uncertainty from the
+//     capture noise, so the operator knows what the calibration is worth.
+#define CAL_MAX_STD_G             0.0030f  // per-axis std over a capture window
+#define CAL_MAX_RECAPTURES        3        // auto-restarts per capture before failing
+#define CAL_TEMP_WARN_C           0.7f     // |T_B - T_A| that triggers the warning
 //  Touch-and-HOLD the on-screen CAL button this long to clear stored calibration.
 #define CAL_CLEAR_HOLD_MS         1500UL
 
