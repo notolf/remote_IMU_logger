@@ -282,9 +282,13 @@ Row cadence:
 report (NOVA-styled, embedded plots — print to PDF from the browser).
 
 ```bash
-pip install numpy pandas matplotlib
 python tools/evaluate_level_log.py level_log_20260611_103000.csv
 ```
+
+Dependencies (numpy, pandas, matplotlib) are **installed automatically on
+first run** if missing. To install them yourself instead:
+`python -m pip install numpy pandas matplotlib` — and the script carries
+PEP 723 metadata, so `uv run tools/evaluate_level_log.py …` works too.
 
 A time-series window opens: **drag** horizontally (on the pitch or roll plot)
 to select one or more ranges of measurement points — `u` undo, `r` reset,

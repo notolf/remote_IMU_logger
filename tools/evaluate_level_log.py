@@ -19,22 +19,59 @@
 #      --settled-only use only settled rows for statistics (default: on)
 #      --include-moving  also include settled=0 rows in the statistics
 #
-#  Dependencies:  pip install numpy pandas matplotlib
-#
-#  Conventions match the firmware: pitch/roll in degrees, the CSV columns of
-#  src/main.cpp (raw + offset-corrected accel, settled flag, IMU temperature,
-#  events). The applied calibration offset is recovered per row from
-#  (ax_raw_g - ax_g), so the report states what was active during the log.
+#  Dependencies: numpy, pandas, matplotlib — AUTO-INSTALLED on first run if
+#  missing (via `<this python> -m pip install`). Manual one-liner:
+#      python -m pip install numpy pandas matplotlib
+#  Runners that understand PEP 723 inline metadata (e.g. `uv run`) handle the
+#  dependencies in an isolated environment automatically.
 # =============================================================================
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["numpy", "pandas", "matplotlib"]
+# ///
 
 import argparse
 import base64
+import importlib.util
 import io
 import json
 import math
 import os
+import subprocess
 import sys
 import datetime as _dt
+
+
+def _ensure_deps():
+    """Install missing third-party packages with the interpreter's own pip.
+    Uses --user outside virtualenvs; on any failure, prints the manual
+    command instead of leaving a half-configured environment."""
+    missing = [m for m in ("numpy", "pandas", "matplotlib")
+               if importlib.util.find_spec(m) is None]
+    if not missing:
+        return
+    print(f"[setup] missing packages: {', '.join(missing)} — installing ...")
+    cmd = [sys.executable, "-m", "pip", "install"]
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    if not in_venv:
+        cmd.append("--user")
+    try:
+        subprocess.check_call(cmd + missing)
+        importlib.invalidate_caches()
+    except Exception:
+        raise SystemExit(
+            "[setup] automatic install failed. Install manually with:\n"
+            f"    {sys.executable} -m pip install numpy pandas matplotlib\n"
+            "(or create a venv first: python -m venv .venv && activate it)")
+    still = [m for m in missing if importlib.util.find_spec(m) is None]
+    if still:
+        raise SystemExit(
+            f"[setup] {', '.join(still)} installed but not importable — restart:\n"
+            f"    {sys.executable} {' '.join(sys.argv)}")
+    print("[setup] dependencies ready.")
+
+
+_ensure_deps()
 
 import numpy as np
 import pandas as pd
