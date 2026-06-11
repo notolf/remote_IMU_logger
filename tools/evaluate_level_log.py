@@ -192,7 +192,7 @@ def select_ranges_interactive(df, dwells):
     fig.canvas.manager.set_window_title("Drag to select ranges — u: undo, r: reset, a: all, ENTER: done")
     for ax, col, color, name in ((axp, "pitch_deg", NOVA["primary"], "pitch"),
                                  (axr, "roll_deg", NOVA["info"], "roll")):
-        ax.plot(df["t_s"], df[col], color=color, lw=0.8)
+        ax.plot(*gap_broken(df["t_s"], df[col]), color=color, lw=0.8)
         ax.set_ylabel(f"{name} [deg]")
         ax.grid(color=NOVA["outvar"], lw=0.5)
         for _, dw in dwells.iterrows():
@@ -341,6 +341,22 @@ def longest_settled_run(df):
 # -----------------------------------------------------------------------------
 # Plots (each returned as a base64 PNG for the self-contained HTML)
 # -----------------------------------------------------------------------------
+def gap_broken(t, y, factor=3.0):
+    """Insert NaNs where the time axis jumps (device moving -> no rows), so
+    line plots show gaps as gaps instead of bridging them with straight
+    segments — without this a sparse log looks deceptively smooth."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(t) < 3:
+        return t, y
+    dt = np.diff(t)
+    med = np.median(dt)
+    idx = np.where(dt > factor * med)[0]
+    if not len(idx):
+        return t, y
+    return np.insert(t, idx + 1, t[idx] + med), np.insert(y, idx + 1, np.nan)
+
+
 def fig_to_b64(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
@@ -365,14 +381,14 @@ def plot_timeseries(df, dwells, ranges):
     fig.patch.set_facecolor(NOVA["card"])
     for ax, col, color, name in ((axp, "pitch_deg", NOVA["primary"], "pitch [deg]"),
                                  (axr, "roll_deg", NOVA["info"], "roll [deg]")):
-        ax.plot(df["t_s"], df[col], color=color, lw=0.8)
+        ax.plot(*gap_broken(df["t_s"], df[col]), color=color, lw=0.8)
         ax.set_ylabel(name)
         style_axes(ax)
         for _, dw in dwells.iterrows():
             ax.axvspan(dw["t0"], dw["t1"], color=NOVA["success"], alpha=0.08)
         for k, (a, b) in enumerate(ranges):
             ax.axvspan(a, b, color=SELECTION_COLORS[k % len(SELECTION_COLORS)], alpha=0.18)
-    axt.plot(df["t_s"], df["imu_temp_c"], color=NOVA["warning"], lw=0.9)
+    axt.plot(*gap_broken(df["t_s"], df["imu_temp_c"]), color=NOVA["warning"], lw=0.9)
     axt.set_ylabel("IMU [°C]")
     axt.set_xlabel("time since log start [s]")
     style_axes(axt)
