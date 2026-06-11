@@ -136,7 +136,8 @@ def load_logs(paths):
         for c in need[:-1]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["millis", "pitch_deg", "roll_deg"]).reset_index(drop=True)
-        df["wall"] = pd.to_datetime(df.get("timestamp_iso"), errors="coerce")
+        df["wall"] = pd.to_datetime(df.get("timestamp_iso"), format="ISO8601",
+                                    errors="coerce")  # NO_TIME -> NaT, silently
         df["t_s"] = (df["millis"] - df["millis"].iloc[0]) / 1000.0 + t_offset
         df["session"] = i
         df["source"] = os.path.basename(p)
@@ -158,9 +159,15 @@ def recovered_offsets(df):
 
 def segment_dwells(df):
     """Contiguous settled==1 runs, ignoring runs shorter than MIN_DWELL_S.
-    Returns a DataFrame of dwell statistics."""
+    A run also ends at a TIME GAP: settled-only logs contain no rows while the
+    device moves, so consecutive rows can be minutes apart yet adjacent in the
+    file — without the gap split, separate placements would merge into one
+    dwell. Returns a DataFrame of dwell statistics."""
     s = (df["settled"] == 1).astype(int)
-    grp = (s.diff().fillna(0) != 0).cumsum()
+    tt = df["t_s"]
+    med = float(np.median(np.diff(tt))) if len(tt) > 2 else 1.0
+    brk = (s.diff().fillna(0) != 0) | (tt.diff().fillna(0) > 3 * med)
+    grp = brk.cumsum()
     rows = []
     for _, g in df.groupby(grp):
         if g["settled"].iloc[0] != 1:
