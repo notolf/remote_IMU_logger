@@ -1,16 +1,16 @@
-# M5Stack CoreS3 — Static Level Logger (standalone)
+# M5Stack CoreS3 — Static Level Logger
 
 Firmware for an **M5Stack CoreS3** that measures **static tilt (pitch & roll) to
 ~0.1°** while the robot is at rest, shows it live on the device screen as a
-**bubble (bullseye) level**, lets the operator **mark events** with the touch
-buttons, and **logs every reading to a CSV file on the microSD card**.
-
-This is a **standalone, offline** build — there is **no WiFi and no web UI**. The
-device is operated entirely from the touchscreen and the data lives on the SD card.
+**bubble (bullseye) level**, logs every reading to a **CSV file on the microSD
+card**, and serves a **live dashboard to your phone** over its own WiFi —
+scan the on-screen QR code and the dashboard pops up. No app, no infrastructure,
+no company network involvement.
 
 The device only measures **at rest** — there is no motion/vibration fusion. The
 gyro is used *only* to detect movement; the tilt comes purely from a heavily
-averaged, calibration-corrected accelerometer reading.
+averaged, calibration-corrected accelerometer reading. The microSD CSV remains
+the data of record; the dashboard is live telemetry plus remote control.
 
 - **Board:** M5Stack CoreS3 (ESP32-S3, 16 MB flash, 8 MB PSRAM, 2.0" touch IPS, microSD, BM8563 RTC, AXP2101 PMU)
 - **IMU:** Bosch **BMI270** via **M5Unified** `M5.Imu` (no raw chip driver, BMM150 unused)
@@ -22,27 +22,40 @@ averaged, calibration-corrected accelerometer reading.
 
 | File | Purpose |
 |------|---------|
-| `platformio.ini` | Build configuration & the single library dependency (M5Unified) |
-| `src/config.h`   | **All tunable parameters** (timezone, thresholds, axes, bubble, cadences) |
-| `src/main.cpp`   | Firmware: IMU, stationary detection, calibration, bubble display, SD logging |
+| `platformio.ini` | Build configuration (M5Unified is the only library dependency; the web stack is all ESP32-core built-ins) |
+| `src/config.h`   | **All tunable parameters** (WiFi, timezone, thresholds, axes, bubble, cadences) |
+| `src/main.cpp`   | Firmware: IMU, stationary detection, calibration, bubble display, SD logging, WiFi + JSON API |
+| `src/web_page.h` | The embedded phone dashboard (single self-contained HTML page, NOVA design tokens) |
 
 ---
 
 ## 1. Configure (optional)
 
-Everything tunable is at the top of **`src/config.h`**. There are **no WiFi
-credentials** to set. The only thing you might change before first flash is the
-timezone used for timestamps:
+Everything tunable is at the top of **`src/config.h`**. Out of the box the
+device hosts its own WiFi (`LevelLogger` / `level1234`) — change those before
+deploying:
+
+```c
+#define AP_SSID  "LevelLogger"
+#define AP_PASS  "level1234"        // WPA2: must be >= 8 characters
+```
+
+Optionally switch `WIFI_MODE_SELECT` to `LOGGER_WIFI_STA` / `LOGGER_WIFI_AUTO`
+to join a **phone hotspot** instead (set `WIFI_SSID`/`WIFI_PASS`; the ESP32 is
+2.4 GHz-only — enable *Maximize Compatibility* on iPhone hotspots). In station
+mode the device also gets **NTP** time automatically and stores it to the RTC.
+
+Timezone for timestamps:
 
 ```c
 #define TZ_INFO            "<+08>-8"     // Asia/Singapore, UTC+8 (POSIX TZ string)
 #define TZ_OFFSET_SECONDS  (8 * 3600)    // keep in sync with TZ_INFO
 ```
 
-Timestamps come from the battery-backed **BM8563 RTC**. Since there is no NTP,
-they are real wall-clock only if the RTC was set beforehand (e.g. with
-M5Burner's *Set time*). If the RTC is unset, log files use an incrementing index
-and `timestamp_iso` is logged as `NO_TIME` — the `millis` column is always valid.
+The measurement parameters (stationary thresholds, averaging window, dwell, log
+cadence, axis signs, level tolerance) in `config.h` are **factory defaults**:
+they can be changed at runtime from the dashboard's **Settings panel** and are
+persisted in NVS — after first boot, the NVS copy wins.
 
 ---
 
@@ -57,7 +70,8 @@ pio device monitor      # serial console @ 115200
 
 (or use the PlatformIO VS Code extension: **Build** / **Upload** / **Monitor**.)
 
-The serial console prints SD status, calibration load/save, and gyro-bias on boot.
+The serial console prints WiFi/SD status, calibration load/save, and the
+gyro-bias capture on boot.
 
 ### If the board won't resolve
 
@@ -71,30 +85,91 @@ platform = https://github.com/pioarduino/platform-espressif32/releases/download/
 
 ---
 
-## 3. On-device controls (touchscreen)
+## 3. Connect your phone (QR → dashboard)
+
+1. **Tap the top strip** of the device screen (where the IP is shown) — a
+   **QR code** appears.
+2. **Scan it with the phone camera.** It is a standard `WIFI:` join code: the
+   phone asks "Join LevelLogger?" — one tap, no password typing.
+3. The network has no internet, so the phone runs its captive-portal check and
+   pops up the **"sign in to network" sheet — which IS the dashboard**. If your
+   phone doesn't show it (vendor-dependent), open **`http://192.168.4.1/`** in
+   the browser (the address is printed on the device screen and below the QR).
+   Tell the phone to **stay connected** despite "no internet" — it keeps using
+   mobile data for everything else.
+
+Several phones can watch simultaneously. In station mode the QR encodes the
+dashboard URL instead (the phone is already on the same hotspot), and
+`http://level.local/` works too.
+
+### What the dashboard shows
+
+- **Bullseye level** with degree-graduated rings, tolerance circle and
+  auto-ranging full scale (lockable to 0.5°/2°/10°/45°) — green bubble when
+  level within tolerance.
+- **Pitch & roll readouts** (3 decimals, tabular numerals) with
+  SETTLED/MOVING state, **averaging progress** (n/500) and live **measurement
+  quality**: std(|a|) in mg and de-biased gyro magnitude, each shown against
+  its threshold (the tick at the bar's midpoint is the threshold).
+- **Trend chart** (last 5/15 min, backfilled from the device's history ring on
+  connect): pitch, roll, optional IMU-temperature trace, settled periods
+  shaded, **event markers** flagged.
+- **Statistics** over the visible window (settled samples only): mean, σ,
+  peak-to-peak, min/max per axis, settled %, ΔT.
+- **Controls:** MARK with free-text label + preset chips, START/STOP logging,
+  **"Sync clock from phone"** (one tap writes the phone's time to the BM8563
+  RTC — fixes `NO_TIME` permanently, no NTP needed), and the **calibration
+  wizard** (below) — so you never have to touch the instrument and disturb it.
+- A loud **CONNECTION LOST** banner when polling stalls — frozen numbers are
+  never silently mistaken for live ones.
+
+The page is a single embedded HTML file (no CDNs — the AP has no internet) and
+follows the **NOVA design system** colour tokens (light + dark mode follow the
+phone). Nova's corporate typeface (Hexagon Akkurat) is licensed and therefore
+not embedded; a close system-font stack with tabular numerals is used.
+
+### JSON API (for your own tooling)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/status`   | GET  | full live state (~5 Hz poll-safe) |
+| `/api/history`  | GET  | trend backfill: `[ms, pitch, roll, temp, flags]` (~15 min @ 1 Hz) |
+| `/api/settings` | GET / POST | read / change runtime settings (form-encoded; `reset=1` = factory defaults) |
+| `/api/mark`     | POST | write an event row (`label=...`) |
+| `/api/log`      | POST | `action=start|stop` |
+| `/api/cal`      | POST | `action=start|next|cancel` — drives the wizard |
+| `/api/time`     | POST | `epoch=<unix-seconds>` → sets system time + RTC |
+
+---
+
+## 4. On-device controls (touchscreen)
 
 The main screen shows the live bubble level plus three touch buttons along the
 bottom:
 
-| Button | Action |
-|--------|--------|
+| Touch | Action |
+|-------|--------|
+| **Top strip** | Show the **connect-your-phone QR** (tap anywhere to close). |
 | **CAL**  | **Tap** = start the calibration wizard. **Hold ~1.5 s** = clear stored calibration (back to UNCALIBRATED). |
 | **MARK** | Write an event row to the CSV immediately (even while moving). |
 | **LOG**  | Start / stop logging (shows **STOP** while logging). |
 
 During the calibration wizard the bottom buttons become **NEXT** (advance /
-finish) and **CANCEL**.
+finish) and **CANCEL**. The wizard state is shared with the dashboard — you can
+drive it from either side.
 
 ---
 
-## 4. Granite-plate flip/reversal calibration (step by step)
+## 5. Granite-plate flip/reversal calibration (step by step)
 
 You need a surface plate that is flat/level to better than the 0.1° target
 (e.g. a granite plate good to ~0.011°). Calibration cancels both the BMI270's
 zero-g offset **and** any residual plate tilt.
 
-> Start the wizard by tapping **CAL**. Advance each step with **NEXT**. The
-> screen shows the current prompt and a progress bar.
+> Start the wizard by tapping **CAL** on the device — or **Start flip
+> calibration** on the dashboard, which is the better way: pressing NEXT on
+> the phone never bumps the device. The screen and the dashboard show the same
+> prompt and progress.
 
 1. **Step 1/2 — Orientation A.** Place the device **flat** on the plate in some
    orientation. Hold it perfectly still and tap **NEXT**. The device collects
@@ -119,15 +194,18 @@ reading_B = −g·sin(tilt) + offset      →      (A + B) / 2 = offset
 - **Validation:** before saving, the firmware checks the device was roughly flat
   in both captures (Z vertical, `az ≈ 1 g`) and that the turn was about the
   **vertical** axis (`az` unchanged A↔B). If a check fails the offsets are **not**
-  saved and the screen shows a red `FAILED: …` so you can retry. Tolerances are
+  saved and a red `FAILED: …` is shown so you can retry. Tolerances are
   `CAL_FLAT_TOL_G` / `CAL_VERT_TOL_G`.
 - Offsets are **persisted in NVS** and reloaded on boot. With no stored
   calibration the device runs at zero offset and clearly shows **UNCALIBRATED**.
-- **Re-run** any time (tap CAL). **Clear** stored calibration by **holding** CAL
-  ~1.5 s.
+- **Re-run** any time. **Clear** stored calibration by **holding** CAL ~1.5 s on
+  the device.
 - The BMI270's zero-g offset **drifts with temperature**, so recalibrate if the
-  operating temperature changes a lot. Every CSV row logs `imu_temp_c` so you can
-  correlate drift after the fact.
+  operating temperature changes a lot. The IMU temperature at calibration time is
+  stored, and the dashboard shows **ΔT since calibration** with a "consider
+  recalibrating" hint past 5 °C. Every CSV row also logs `imu_temp_c`.
+  Practical tip: the WiFi radio warms the die — let the device reach its normal
+  operating temperature (a few minutes, radio on) *before* calibrating.
 
 ### Accelerometer range (±2 g)
 
@@ -145,15 +223,15 @@ scaling stays consistent, then rebuild.
 
 ---
 
-## 5. Where the CSV lands & how to read it
+## 6. Where the CSV lands & how to read it
 
 - A new file is created on the microSD at boot:
-  - With a valid clock (RTC set): **`/level_log_YYYYMMDD_HHMMSS.csv`**
+  - With a valid clock (RTC set / synced from phone / NTP): **`/level_log_YYYYMMDD_HHMMSS.csv`**
   - Without a clock: an incrementing index, **`/level_log_0001.csv`**, etc.
 - The file is **flushed after every write** (`LOG_FLUSH_EVERY`), so data survives
-  a power loss on the robot. A missing/failed card is handled gracefully — the
-  device keeps running, shows the SD state on screen, and re-probes for a card
-  every few seconds.
+  a power loss on the robot. A missing/failed/removed card is handled gracefully —
+  the device keeps running, shows the SD state on screen and dashboard, re-probes
+  every few seconds, and recovers automatically when a card is (re)inserted.
 
 ### Columns
 
@@ -175,65 +253,77 @@ settled, calibrated, imu_temp_c, battery_pct, event_flag, event_label
 | `calibrated` | `1` = stored flip-calibration applied; `0` = UNCALIBRATED |
 | `imu_temp_c` | BMI270 die temperature (for drift correlation) |
 | `battery_pct` | Battery %, `-1` if unavailable |
-| `event_flag` | `1` if this row was produced by a **MARK** press, else `0` |
-| `event_label` | Event label (`device-button` for the MARK button), CSV-escaped |
+| `event_flag` | `1` if this row was produced by a **MARK** (device button or dashboard), else `0` |
+| `event_label` | Event label (`device-button`, `web-mark`, or your custom dashboard label), CSV-escaped |
 
 Row cadence:
 - One **settled** row every `SETTLED_LOG_INTERVAL_MS` (default 1 s) while at rest.
-- **Event** rows are written immediately when **MARK** is pressed, even while
-  moving, so the moment is captured.
-- Moving rows are *off* by default; enable with `LOG_WHILE_MOVING` in `config.h`.
+- **Event** rows are written immediately when **MARK** is pressed (device or
+  phone), even while moving, so the moment is captured.
+- Moving rows are *off* by default; enable from the dashboard Settings panel
+  (or `LOG_WHILE_MOVING` as the factory default).
 
 ---
 
-## 6. How it works (brief)
+## 7. How it works (brief)
 
 - **Sampling:** the accelerometer + gyro are read at `IMU_SAMPLE_RATE_HZ`
   (100 Hz) on a non-blocking `millis()` schedule.
 - **Stationary detection:** requires a quiet gyro (de-biased magnitude below
-  `STATIONARY_GYRO_THRESH_DPS`) **and** a quiet accelerometer (low `std(|a|)` and
-  `|a|` near 1 g), sustained for `STATIONARY_DWELL_MS`.
-- **Tilt:** while stationary, a moving average of up to `AVG_SAMPLES` *consecutive
-  rest* samples is taken (the window resets the instant motion is seen, so it
-  never mixes in moving data); the row is flagged `settled` once the device has
-  been still for the dwell time, and the average keeps sharpening toward the full
-  `AVG_SAMPLES` as it stays still. The calibration offsets are subtracted and
-  pitch/roll are computed with `atan2`. Axis signs are flippable via `PITCH_SIGN`,
-  `ROLL_SIGN` and the two axes can be exchanged with `SWAP_PITCH_ROLL` (mounting
-  orientation is unknown).
-- **Gyro bias:** measured at boot (keep the device still for ~2 s) and slowly
-  re-tracked while confidently at rest to follow temperature drift.
+  the gyro threshold) **and** a quiet accelerometer (low `std(|a|)` and `|a|`
+  near 1 g), sustained for the dwell time. All thresholds are live-tunable from
+  the dashboard and persisted in NVS.
+- **Tilt:** while stationary, a moving average of up to `avg samples`
+  *consecutive rest* samples is taken (the window resets the instant motion is
+  seen, so it never mixes in moving data); the row is flagged `settled` once the
+  device has been still for the dwell time, and the average keeps sharpening
+  toward the full window as it stays still. The calibration offsets are
+  subtracted and pitch/roll are computed with `atan2`. Axis swap is applied
+  first, then the signs flip the final pitch/roll (Settings panel).
+- **Gyro bias:** measured at boot with a **validated** capture (retried if the
+  device was moving) and slowly re-tracked while confidently at rest to follow
+  temperature drift.
+- **Web stack:** the device answers all DNS queries on its soft-AP (captive
+  portal) and serves the dashboard + JSON API with the ESP32 core's
+  **synchronous** WebServer. Every HTTP handler runs inside `loop()` — there is
+  deliberately no async server task, so firmware state needs no locking. The
+  dashboard polls `/api/status` at ~5 Hz; a 1 Hz on-device history ring
+  (~15 min) backfills the trend chart on connect.
 
 ### On-device bubble level
 
 The main screen is a live **bullseye spirit level**: a bubble drifts toward the
 raised side as you tilt the device, and the numeric **pitch and roll** for both
 axes are shown beside it (green when settled/high-confidence, amber while moving).
+The top strip shows the WiFi address and opens the connect-QR when tapped.
 
 - **Auto-ranging scale** — the vial's full-scale (degrees at the outer ring)
   adjusts automatically with hysteresis: it zooms *in* for sub-degree work (max
   sensitivity) and zooms *out* so the bubble never leaves the vial. The current
   full-scale (e.g. `+/-2.0 deg`) is printed under the bubble. Steps and behaviour
   are set by `BUBBLE_SCALE_STEPS` / `BUBBLE_FILL_FRACTION` in `config.h`.
-- The bubble turns **green** when both axes are within `LEVEL_TOLERANCE_DEG` of
-  level. Its motion is lightly smoothed (`BUBBLE_SMOOTH_ALPHA`) so it is
-  responsive but steady. If the bubble drifts the "wrong" way for your mounting,
-  flip `PITCH_SIGN` / `ROLL_SIGN`.
-
-All thresholds, the averaging size, the dwell, cadences, axis conventions, and
-the bubble behaviour are grouped at the top of **`src/config.h`**.
+- The bubble turns **green** when both axes are within the level tolerance.
+  Its motion is lightly smoothed (`BUBBLE_SMOOTH_ALPHA`) so it is responsive but
+  steady. If the bubble drifts the "wrong" way for your mounting, flip the
+  pitch/roll signs in the dashboard Settings panel.
 
 ---
 
 ## Notes
 
 - Uses M5Unified `M5.Imu` (BMI270) only — no raw chip driver, no BMM150. See
-  **§4 “Accelerometer range”** for the ±2 g note.
-- Flip/reversal calibration with validation, offsets persisted in NVS, survive
-  reboot, **UNCALIBRATED** clearly indicated when absent.
+  **§5 "Accelerometer range"** for the ±2 g note.
+- Flip/reversal calibration with validation (drivable from the phone), offsets
+  + calibration temperature persisted in NVS, survive reboot, **UNCALIBRATED**
+  clearly indicated when absent.
 - Static tilt output to 2–3 decimals; only settled readings flagged
   high-confidence.
-- CSV with raw + corrected data, flushed per write, tolerates a missing card
-  without crashing.
-- **No networking:** WiFi, NTP and the web server have been removed; the device
-  is fully self-contained.
+- CSV with raw + corrected data, flushed per write; tolerates a missing or
+  removed card without crashing and remounts automatically.
+- **Networking is point-to-point only:** the device's soft-AP serves the
+  dashboard to phones nearby; nothing touches a company network. Station mode
+  (phone hotspot) is an opt-in compile-time choice. There is no cloud, no
+  external service, plain HTTP on a private link.
+- The WiFi radio adds a little heat and the BMI270 offset drifts with
+  temperature — calibrate at operating temperature; the dashboard's
+  **ΔT since calibration** hint tracks this.

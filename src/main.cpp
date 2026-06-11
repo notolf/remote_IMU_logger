@@ -1,12 +1,18 @@
 // =============================================================================
-//  M5Stack CoreS3 — Static Level Logger (standalone / offline)
+//  M5Stack CoreS3 — Static Level Logger (touchscreen + phone web dashboard)
 // -----------------------------------------------------------------------------
 //  Measures static tilt (pitch & roll) to ~0.1 deg while the robot is at REST,
 //  shows it live on-screen as a bubble level, lets the operator mark events with
 //  the touch buttons, and logs every reading to a CSV file on the microSD card.
 //
-//  No networking: WiFi and the web UI have been removed. The device is operated
-//  entirely from the touchscreen and the data lives on the microSD card.
+//  Remote monitoring: the device hosts its own WiFi soft-AP (or joins a phone
+//  hotspot in station mode) and serves the embedded dashboard from web_page.h
+//  over plain HTTP, with a captive portal so a phone that scans the on-screen
+//  QR code lands straight on the live view. The dashboard polls /api/status;
+//  commands (mark / log / calibration / clock / settings) are handled by the
+//  SYNCHRONOUS WebServer, i.e. inside loop() context — deliberately no async
+//  server and no cross-task handoff. The microSD CSV stays the data of record;
+//  the dashboard is telemetry plus remote control.
 //
 //  Hardware  : M5Stack CoreS3 (ESP32-S3 / BMI270 IMU / BM8563 RTC / AXP2101 PMU)
 //  IMU       : Bosch BMI270 via M5Unified's M5.Imu abstraction (NO raw driver,
@@ -28,10 +34,16 @@
 #include <FS.h>
 #include <SD.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <time.h>
+#include <sys/time.h>
 #include <math.h>
 
 #include "config.h"
+#include "web_page.h"
 
 // -----------------------------------------------------------------------------
 // RGB565 colour fallbacks — M5GFX defines these TFT_* names, but guard anyway so
@@ -85,8 +97,27 @@ enum CalStep {
 // =============================================================================
 static bool  g_imuOk = false;
 
+// --- runtime settings: factory defaults come from config.h, the live values
+//     are persisted in NVS and editable from the dashboard's Settings panel.
+struct Settings {
+  float    gyroThreshDps;   // stationary: gyro quiet threshold (deg/s)
+  float    accelStdG;       // stationary: std(|a|) threshold (g)
+  float    accelMagTolG;    // stationary: ||a| - 1 g| tolerance (g)
+  uint32_t dwellMs;         // stationary: dwell before "settled" (ms)
+  uint16_t avgSamples;      // averaging window (samples, <= MAX_AVG_SAMPLES)
+  uint32_t settledLogMs;    // CSV cadence while settled (ms)
+  bool     logWhileMoving;  // also log low-rate rows while moving
+  uint32_t movingLogMs;     // CSV cadence while moving (ms)
+  float    levelTolDeg;     // "level" tolerance for the bubble / dashboard (deg)
+  float    pitchSign;       // +1 / -1
+  float    rollSign;        // +1 / -1
+  bool     swapPitchRoll;   // exchange the axes (applied BEFORE the signs)
+};
+static Settings g_set;
+
 // --- N-sample averaging ring buffer (only ever holds *consecutive* rest samples)
-static float  g_bufAx[AVG_SAMPLES], g_bufAy[AVG_SAMPLES], g_bufAz[AVG_SAMPLES];
+//     Sized for the compile-time maximum; the live window is g_set.avgSamples.
+static float  g_bufAx[MAX_AVG_SAMPLES], g_bufAy[MAX_AVG_SAMPLES], g_bufAz[MAX_AVG_SAMPLES];
 static int    g_bufHead = 0, g_bufCount = 0;
 static double g_sumAx = 0, g_sumAy = 0, g_sumAz = 0;
 
@@ -110,6 +141,8 @@ static float  g_dispPitch = 0, g_dispRoll = 0;     // smoothed live tilt for the
 static bool   g_settled = false;                   // at rest >= dwell time
 static int    g_stationaryStreak = 0;              // consecutive rest samples
 static float  g_imuTemp = NAN;
+static float  g_accelSd = -1;                      // live std(|a|) in g (-1 = warming up)
+static float  g_gyroMag = 0;                       // live de-biased |gyro| (deg/s)
 
 // --- cached slow-changing reads (kept off the 100 Hz hot path) ----------------
 static int    g_battery = -1;
@@ -118,6 +151,7 @@ static bool   g_charging = false;
 // --- calibration
 static bool    g_calibrated = false;
 static float   g_offX = 0, g_offY = 0, g_offZ = 0;
+static float   g_calTempC = NAN;                   // IMU temp when cal was captured
 static CalStep g_calStep = CAL_IDLE;
 static float   g_calA[3] = {0,0,0}, g_calB[3] = {0,0,0};
 static bool    g_calError = false;                 // last calibration validation failed
@@ -131,7 +165,28 @@ static File     g_logFile;
 static String   g_logName = "";
 static String   g_sdStatus = "no card";
 static uint32_t g_eventCount = 0;
+static uint32_t g_rowsWritten = 0;
 static int      g_flushCounter = 0;
+
+// --- trend history ring: 1 Hz pitch/roll/temp, backfills the dashboard chart
+struct HistEntry { uint32_t ms; float pitch, roll, temp; uint8_t flags; }; // b0 settled, b1 event
+static HistEntry g_hist[HISTORY_LENGTH];
+static int  g_histHead = 0, g_histCount = 0;
+static bool g_histEventLatch = false;              // event since the last entry
+
+// --- recent event labels (for the dashboard's event list / chart markers)
+struct EventRec { uint32_t ms; char label[32]; };
+static EventRec g_events[EVENT_RING_LENGTH];
+static int g_evHead = 0, g_evCount = 0;
+
+// --- WiFi / web (sync server: handlers run in loop() context)
+static WebServer g_http(WEB_SERVER_PORT);
+static DNSServer g_dns;
+static bool   g_apMode = false;                    // soft-AP (true) vs station
+static String g_ip = "";
+static bool   g_rtcSyncedFromNtp = false;          // STA mode: NTP -> RTC once
+static bool   g_showQr = false;                    // QR overlay on the device LCD
+static char   g_qrText[80] = "";
 
 // --- display
 static M5Canvas g_canvas(&M5.Display);
@@ -168,27 +223,42 @@ static String clockString();
 static int calProgress();
 static String calPrompt();
 static String csvField(const String& s);
+static void settingsDefaults();
+static void settingsLoad();
+static void settingsSave();
+static void settingsSanitize();
+static void historyTick();
+static void setupWiFi();
+static void setupWeb();
+static void wifiTick();
+static void drawQrScreen();
+static const char* calStepName();
 
 // small helpers
 static inline bool  isNan(float f) { return f != f; }
 static inline bool  hit(int x, int y, const Rect& r) {
   return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
 }
+static inline int   dwellSamples() { return (int)(g_set.dwellMs / SAMPLE_INTERVAL_MS); }
+static inline float clampF(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
 
 // =============================================================================
 // Axis / sign convention  (device flat, screen up  ->  pitch = roll = 0)
 //   pitch = atan2( ax, sqrt(ay^2 + az^2) )     roll = atan2( ay, sqrt(ax^2+az^2) )
-//   The mounting orientation on the robot is unknown, so the polarity is easy to
-//   flip with PITCH_SIGN / ROLL_SIGN, and the two axes can be exchanged with
-//   SWAP_PITCH_ROLL (all in config.h). Note: because az enters only as az^2,
-//   the formula already gives correct small-tilt angles whether the CoreS3 reads
-//   az ~ +1 g or ~ -1 g when flat.
+//   The mounting orientation on the robot is unknown, so the axes can be
+//   exchanged (swap, applied FIRST) and each final output's polarity flipped
+//   (signs) — runtime-tunable from the dashboard, defaults in config.h. Note:
+//   because az enters only as az^2, the formula already gives correct
+//   small-tilt angles whether the CoreS3 reads az ~ +1 g or ~ -1 g when flat.
 // =============================================================================
 static void anglesFromCorrected(float ax, float ay, float az, float* p, float* r) {
-  float pitch = atan2f(ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG * PITCH_SIGN;
-  float roll  = atan2f(ay, sqrtf(ax * ax + az * az)) * RAD_TO_DEG * ROLL_SIGN;
-  if (SWAP_PITCH_ROLL) { float t = pitch; pitch = roll; roll = t; }
-  *p = pitch; *r = roll;
+  float pitch = atan2f(ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
+  float roll  = atan2f(ay, sqrtf(ax * ax + az * az)) * RAD_TO_DEG;
+  if (g_set.swapPitchRoll) { float t = pitch; pitch = roll; roll = t; }
+  *p = pitch * g_set.pitchSign;
+  *r = roll  * g_set.rollSign;
 }
 
 // =============================================================================
@@ -196,7 +266,9 @@ static void anglesFromCorrected(float ax, float ay, float az, float* p, float* r
 // =============================================================================
 static void bufReset() { g_bufHead = 0; g_bufCount = 0; g_sumAx = g_sumAy = g_sumAz = 0; }
 static void bufAdd(float ax, float ay, float az) {
-  if (g_bufCount == AVG_SAMPLES) {                 // full -> subtract oldest
+  // The live window is g_set.avgSamples; any runtime change to it goes through
+  // bufReset() (enforced in the settings handler), so head/count stay coherent.
+  if (g_bufCount >= g_set.avgSamples) {            // full -> subtract oldest
     g_sumAx -= g_bufAx[g_bufHead];
     g_sumAy -= g_bufAy[g_bufHead];
     g_sumAz -= g_bufAz[g_bufHead];
@@ -205,7 +277,7 @@ static void bufAdd(float ax, float ay, float az) {
   }
   g_bufAx[g_bufHead] = ax; g_bufAy[g_bufHead] = ay; g_bufAz[g_bufHead] = az;
   g_sumAx += ax; g_sumAy += ay; g_sumAz += az;
-  g_bufHead = (g_bufHead + 1) % AVG_SAMPLES;
+  g_bufHead = (g_bufHead + 1) % g_set.avgSamples;
 }
 
 static void magReset() { g_magHead = 0; g_magCount = 0; g_magSum = 0; g_magSumSq = 0; }
@@ -245,7 +317,8 @@ static void imuSampleTick() {
   // ---- de-biased gyro magnitude (gyro is used ONLY for rest detection) -------
   float dgx = gx - g_gyroBias[0], dgy = gy - g_gyroBias[1], dgz = gz - g_gyroBias[2];
   float gyroMag = sqrtf(dgx * dgx + dgy * dgy + dgz * dgz);
-  bool gyroQuiet = (gyroMag < STATIONARY_GYRO_THRESH_DPS);
+  g_gyroMag = gyroMag;                               // exposed on the dashboard
+  bool gyroQuiet = (gyroMag < g_set.gyroThreshDps);
 
   // ---- accel "quiet" test: std(|a|) low AND |a| near 1 g ---------------------
   float amag = sqrtf(ax * ax + ay * ay + az * az);
@@ -255,8 +328,11 @@ static void imuSampleTick() {
     float mean = (float)(g_magSum / g_magCount);
     float var  = (float)(g_magSumSq / g_magCount - (double)mean * mean);
     float sd   = var > 0 ? sqrtf(var) : 0;
-    accelQuiet = (sd < STATIONARY_ACCEL_STD_G) &&
-                 (fabsf(mean - 1.0f) < STATIONARY_ACCEL_MAG_TOL_G);
+    g_accelSd  = sd;                                 // exposed on the dashboard
+    accelQuiet = (sd < g_set.accelStdG) &&
+                 (fabsf(mean - 1.0f) < g_set.accelMagTolG);
+  } else {
+    g_accelSd = -1;                                  // window still warming up
   }
 
   // ---- slow adaptive gyro-bias tracking while confidently at rest ------------
@@ -289,7 +365,7 @@ static void imuSampleTick() {
     g_avgAy = g_avgRawAy - g_offY;
     g_avgAz = g_avgRawAz - g_offZ;
     anglesFromCorrected(g_avgAx, g_avgAy, g_avgAz, &g_pitch, &g_roll);
-    g_settled = (g_stationaryStreak >= (int)DWELL_SAMPLES);
+    g_settled = (g_stationaryStreak >= dwellSamples());
   } else {
     // motion: reset accumulators; hold last settled angle for the display
     g_stationaryStreak = 0;
@@ -332,13 +408,13 @@ static void calibAdvance() {                          // "Next" / "Finish" butto
 
 static void calibrationTick() {
   // A capture/B capture complete once a full clean N-sample window is collected.
-  if (g_calStep == CAL_CAPTURE_A && g_bufCount >= AVG_SAMPLES) {
+  if (g_calStep == CAL_CAPTURE_A && g_bufCount >= g_set.avgSamples) {
     g_calA[0] = (float)(g_sumAx / g_bufCount);
     g_calA[1] = (float)(g_sumAy / g_bufCount);
     g_calA[2] = (float)(g_sumAz / g_bufCount);
     Serial.printf("[CAL] A = %.5f %.5f %.5f\n", g_calA[0], g_calA[1], g_calA[2]);
     g_calStep = CAL_WAIT_B;
-  } else if (g_calStep == CAL_CAPTURE_B && g_bufCount >= AVG_SAMPLES) {
+  } else if (g_calStep == CAL_CAPTURE_B && g_bufCount >= g_set.avgSamples) {
     g_calB[0] = (float)(g_sumAx / g_bufCount);
     g_calB[1] = (float)(g_sumAy / g_bufCount);
     g_calB[2] = (float)(g_sumAz / g_bufCount);
@@ -376,9 +452,19 @@ static void calibrationTick() {
 
 static int calProgress() {
   if (g_calStep == CAL_CAPTURE_A || g_calStep == CAL_CAPTURE_B)
-    return (int)(100L * g_bufCount / AVG_SAMPLES);
+    return (int)(100L * g_bufCount / g_set.avgSamples);
   if (g_calStep == CAL_DONE) return 100;
   return 0;
+}
+static const char* calStepName() {                   // for the JSON API
+  switch (g_calStep) {
+    case CAL_WAIT_A:    return "wait_a";
+    case CAL_CAPTURE_A: return "cap_a";
+    case CAL_WAIT_B:    return "wait_b";
+    case CAL_CAPTURE_B: return "cap_b";
+    case CAL_DONE:      return "done";
+    default:            return "idle";
+  }
 }
 static String calPrompt() {
   switch (g_calStep) {
@@ -402,17 +488,20 @@ static void loadCalibration() {
   g_offX = g_prefs.getFloat("offX", 0);
   g_offY = g_prefs.getFloat("offY", 0);
   g_offZ = g_prefs.getFloat("offZ", 0);
+  g_calTempC = g_prefs.getFloat("calT", NAN);       // for the drift hint
   g_prefs.end();
   Serial.printf("[NVS] calibration %s  offsets=(%.5f, %.5f, %.5f)\n",
                 g_calibrated ? "LOADED" : "ABSENT -> UNCALIBRATED",
                 g_offX, g_offY, g_offZ);
 }
 static void saveCalibration() {
-  g_prefs.begin(NVS_NAMESPACE, false);
+  g_calTempC = g_imuTemp;                           // BMI270 offset drifts with temp:
+  g_prefs.begin(NVS_NAMESPACE, false);              // remember when/where we calibrated
   g_prefs.putBool("cal", true);
   g_prefs.putFloat("offX", g_offX);
   g_prefs.putFloat("offY", g_offY);
   g_prefs.putFloat("offZ", g_offZ);
+  g_prefs.putFloat("calT", g_calTempC);
   g_prefs.end();
   Serial.println("[NVS] calibration saved");
 }
@@ -420,8 +509,88 @@ static void clearCalibration() {
   g_prefs.begin(NVS_NAMESPACE, false);
   g_prefs.clear();
   g_prefs.end();
-  g_calibrated = false; g_offX = g_offY = g_offZ = 0;
+  g_calibrated = false; g_offX = g_offY = g_offZ = 0; g_calTempC = NAN;
   Serial.println("[NVS] calibration cleared -> UNCALIBRATED");
+}
+
+// =============================================================================
+// Runtime settings persistence (NVS) — defaults in config.h, edited from the
+// dashboard's Settings panel. Sanitized on every load/apply so a bad value can
+// never wedge the stationary detector.
+// =============================================================================
+static void settingsDefaults() {
+  g_set.gyroThreshDps  = STATIONARY_GYRO_THRESH_DPS;
+  g_set.accelStdG      = STATIONARY_ACCEL_STD_G;
+  g_set.accelMagTolG   = STATIONARY_ACCEL_MAG_TOL_G;
+  g_set.dwellMs        = STATIONARY_DWELL_MS;
+  g_set.avgSamples     = AVG_SAMPLES;
+  g_set.settledLogMs   = SETTLED_LOG_INTERVAL_MS;
+  g_set.logWhileMoving = LOG_WHILE_MOVING;
+  g_set.movingLogMs    = MOVING_LOG_INTERVAL_MS;
+  g_set.levelTolDeg    = LEVEL_TOLERANCE_DEG;
+  g_set.pitchSign      = PITCH_SIGN;
+  g_set.rollSign       = ROLL_SIGN;
+  g_set.swapPitchRoll  = SWAP_PITCH_ROLL;
+}
+static void settingsSanitize() {
+  g_set.gyroThreshDps = clampF(g_set.gyroThreshDps, 0.05f, 10.0f);
+  g_set.accelStdG     = clampF(g_set.accelStdG,   0.0005f, 0.05f);
+  g_set.accelMagTolG  = clampF(g_set.accelMagTolG,  0.01f, 0.5f);
+  if (g_set.dwellMs < 200)            g_set.dwellMs = 200;
+  if (g_set.dwellMs > 10000)          g_set.dwellMs = 10000;
+  if (g_set.avgSamples < 50)          g_set.avgSamples = 50;
+  if (g_set.avgSamples > MAX_AVG_SAMPLES) g_set.avgSamples = MAX_AVG_SAMPLES;
+  if (g_set.settledLogMs < 100)       g_set.settledLogMs = 100;
+  if (g_set.settledLogMs > 60000)     g_set.settledLogMs = 60000;
+  if (g_set.movingLogMs < 100)        g_set.movingLogMs = 100;
+  if (g_set.movingLogMs > 60000)      g_set.movingLogMs = 60000;
+  g_set.levelTolDeg = clampF(g_set.levelTolDeg, 0.02f, 5.0f);
+  g_set.pitchSign = g_set.pitchSign < 0 ? -1.0f : +1.0f;
+  g_set.rollSign  = g_set.rollSign  < 0 ? -1.0f : +1.0f;
+}
+static void settingsLoad() {
+  settingsDefaults();
+  g_prefs.begin(NVS_CFG_NAMESPACE, true);
+  if (g_prefs.getUChar("v", 0) == 1) {              // versioned for future migration
+    g_set.gyroThreshDps  = g_prefs.getFloat("gyTh",  g_set.gyroThreshDps);
+    g_set.accelStdG      = g_prefs.getFloat("sgTh",  g_set.accelStdG);
+    g_set.accelMagTolG   = g_prefs.getFloat("mgTl",  g_set.accelMagTolG);
+    g_set.dwellMs        = g_prefs.getULong("dwMs",  g_set.dwellMs);
+    g_set.avgSamples     = g_prefs.getUShort("avgN", g_set.avgSamples);
+    g_set.settledLogMs   = g_prefs.getULong("lgMs",  g_set.settledLogMs);
+    g_set.logWhileMoving = g_prefs.getBool("lgMv",   g_set.logWhileMoving);
+    g_set.movingLogMs    = g_prefs.getULong("mvMs",  g_set.movingLogMs);
+    g_set.levelTolDeg    = g_prefs.getFloat("tol",   g_set.levelTolDeg);
+    g_set.pitchSign      = g_prefs.getFloat("pSgn",  g_set.pitchSign);
+    g_set.rollSign       = g_prefs.getFloat("rSgn",  g_set.rollSign);
+    g_set.swapPitchRoll  = g_prefs.getBool("swap",   g_set.swapPitchRoll);
+    Serial.println("[CFG] runtime settings loaded from NVS");
+  } else {
+    Serial.println("[CFG] no stored settings -> factory defaults");
+  }
+  g_prefs.end();
+  settingsSanitize();
+  Serial.printf("[CFG] gyro<%.2f dps, sd<%.4f g, dwell=%lu ms, avg=%u, tol=%.2f deg\n",
+                g_set.gyroThreshDps, g_set.accelStdG,
+                (unsigned long)g_set.dwellMs, g_set.avgSamples, g_set.levelTolDeg);
+}
+static void settingsSave() {
+  g_prefs.begin(NVS_CFG_NAMESPACE, false);
+  g_prefs.putUChar("v", 1);
+  g_prefs.putFloat("gyTh",  g_set.gyroThreshDps);
+  g_prefs.putFloat("sgTh",  g_set.accelStdG);
+  g_prefs.putFloat("mgTl",  g_set.accelMagTolG);
+  g_prefs.putULong("dwMs",  g_set.dwellMs);
+  g_prefs.putUShort("avgN", g_set.avgSamples);
+  g_prefs.putULong("lgMs",  g_set.settledLogMs);
+  g_prefs.putBool("lgMv",   g_set.logWhileMoving);
+  g_prefs.putULong("mvMs",  g_set.movingLogMs);
+  g_prefs.putFloat("tol",   g_set.levelTolDeg);
+  g_prefs.putFloat("pSgn",  g_set.pitchSign);
+  g_prefs.putFloat("rSgn",  g_set.rollSign);
+  g_prefs.putBool("swap",   g_set.swapPitchRoll);
+  g_prefs.end();
+  Serial.println("[CFG] runtime settings saved");
 }
 
 // Centered two-line boot/status banner (used during the blocking startup steps
@@ -442,21 +611,42 @@ static void bootBanner(const char* l1, const char* l2, uint16_t color) {
   }
 }
 
-// Measured once at boot (device must be still). Removes the BMI270 gyro bias so
-// the absolute gyro-magnitude rest threshold is meaningful.
+// Measured at boot (device must be still). Removes the BMI270 gyro bias so the
+// absolute gyro-magnitude rest threshold is meaningful. The capture is
+// VALIDATED: if the per-axis std-dev says the device was moving (boot in hand,
+// robot vibrating), it retries instead of poisoning rest detection with a bad
+// bias that the slow adaptive tracker might never recover from.
 static void measureGyroBias() {
   if (!g_imuOk) return;
-  bootBanner("Measuring gyro", "KEEP STILL...", TFT_YELLOW);
-  double s[3] = {0, 0, 0}; int n = 0;
-  for (int i = 0; i < GYRO_BIAS_SAMPLES; i++) {
-    M5.Imu.update();
-    auto d = M5.Imu.getImuData();
-    s[0] += d.gyro.x; s[1] += d.gyro.y; s[2] += d.gyro.z; n++;
-    delay(SAMPLE_INTERVAL_MS);
+  for (int attempt = 1; attempt <= GYRO_BIAS_MAX_ATTEMPTS; attempt++) {
+    bootBanner("Measuring gyro",
+               attempt == 1 ? "KEEP STILL..." : "MOVED! retrying - KEEP STILL",
+               TFT_YELLOW);
+    double s[3] = {0, 0, 0}, sq[3] = {0, 0, 0}; int n = 0;
+    for (int i = 0; i < GYRO_BIAS_SAMPLES; i++) {
+      M5.Imu.update();
+      auto d = M5.Imu.getImuData();
+      float g3[3] = { d.gyro.x, d.gyro.y, d.gyro.z };
+      for (int a = 0; a < 3; a++) { s[a] += g3[a]; sq[a] += (double)g3[a] * g3[a]; }
+      n++;
+      delay(SAMPLE_INTERVAL_MS);
+    }
+    float maxSd = 0;
+    for (int a = 0; a < 3; a++) {
+      double mean = s[a] / n, var = sq[a] / n - mean * mean;
+      float sd = var > 0 ? sqrtf((float)var) : 0;
+      if (sd > maxSd) maxSd = sd;
+    }
+    if (maxSd <= GYRO_BIAS_MAX_STD_DPS || attempt == GYRO_BIAS_MAX_ATTEMPTS) {
+      g_gyroBias[0] = s[0] / n; g_gyroBias[1] = s[1] / n; g_gyroBias[2] = s[2] / n;
+      Serial.printf("[IMU] gyro bias = %.4f %.4f %.4f dps (n=%d, sd=%.3f%s)\n",
+                    g_gyroBias[0], g_gyroBias[1], g_gyroBias[2], n, maxSd,
+                    maxSd > GYRO_BIAS_MAX_STD_DPS ? " NOISY - accepted anyway" : "");
+      return;
+    }
+    Serial.printf("[IMU] gyro bias capture noisy (sd=%.3f dps) -> retry %d/%d\n",
+                  maxSd, attempt + 1, GYRO_BIAS_MAX_ATTEMPTS);
   }
-  if (n) { g_gyroBias[0] = s[0] / n; g_gyroBias[1] = s[1] / n; g_gyroBias[2] = s[2] / n; }
-  Serial.printf("[IMU] gyro bias = %.4f %.4f %.4f dps (n=%d)\n",
-                g_gyroBias[0], g_gyroBias[1], g_gyroBias[2], n);
 }
 
 // =============================================================================
@@ -491,6 +681,10 @@ static String clockString() {
 // microSD + CSV logging
 // =============================================================================
 static bool sdMount() {
+  // Drop any stale mount first: after a card removal / write error, SD.begin()
+  // alone would return true on the dead driver state and never re-probe the
+  // card, leaving the logger stuck at "open error" until reboot.
+  SD.end();
   SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
   if (!SD.begin(SD_SPI_CS_PIN, SPI, SD_SPI_FREQ_HZ)) {
     Serial.println("[SD] no card / mount failed");
@@ -516,7 +710,7 @@ static bool openLog() {
   g_sdOk = true;
   g_logName = makeLogName();
   g_logFile = SD.open(g_logName.c_str(), FILE_WRITE);
-  if (!g_logFile) { g_sdStatus = "open error";
+  if (!g_logFile) { g_sdStatus = "open error"; g_sdOk = false; // keep the retry loop alive
                     Serial.printf("[SD] cannot open %s\n", g_logName.c_str()); return false; }
   g_logFile.println("timestamp_iso,millis,pitch_deg,roll_deg,"
                     "ax_g,ay_g,az_g,ax_raw_g,ay_raw_g,az_raw_g,gx_dps,gy_dps,gz_dps,"
@@ -576,11 +770,19 @@ static void writeRow(bool settled, int eventFlag, const String& label) {
     Serial.println("[SD] write failed -> will re-probe card");
     return;
   }
+  g_rowsWritten++;
   if (++g_flushCounter >= LOG_FLUSH_EVERY) { g_logFile.flush(); g_flushCounter = 0; }
 }
 
 static void markEvent(const String& label) {
   g_eventCount++;
+  EventRec& e = g_events[g_evHead];                 // remember for the dashboard
+  e.ms = millis();
+  strncpy(e.label, label.c_str(), sizeof(e.label) - 1);
+  e.label[sizeof(e.label) - 1] = '\0';
+  g_evHead = (g_evHead + 1) % EVENT_RING_LENGTH;
+  if (g_evCount < EVENT_RING_LENGTH) g_evCount++;
+  g_histEventLatch = true;                          // flag it in the trend history
   // Capture the event at the moment it is triggered, even if not settled.
   writeRow(g_settled, 1, label);
   Serial.printf("[EVENT] #%u  '%s'  (settled=%d)\n", g_eventCount, label.c_str(), g_settled);
@@ -604,17 +806,323 @@ static void loggingTick() {
   if (!g_logging) return;
   static uint32_t lastSettled = 0, lastMoving = 0;
   if (g_settled) {
-    if (now - lastSettled >= SETTLED_LOG_INTERVAL_MS) { lastSettled = now; writeRow(true, 0, ""); }
-  } else if (LOG_WHILE_MOVING) {
-    if (now - lastMoving >= MOVING_LOG_INTERVAL_MS)   { lastMoving = now; writeRow(false, 0, ""); }
+    if (now - lastSettled >= g_set.settledLogMs) { lastSettled = now; writeRow(true, 0, ""); }
+  } else if (g_set.logWhileMoving) {
+    if (now - lastMoving >= g_set.movingLogMs)   { lastMoving = now; writeRow(false, 0, ""); }
+  }
+}
+
+// One trend-history entry per second: the same value the CSV would log (the
+// sharpened average once settled, the instantaneous reading otherwise), so the
+// dashboard chart can be backfilled on connect.
+static void historyTick() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < HISTORY_INTERVAL_MS) return;
+  last = now;
+  if (!g_imuOk) return;
+  HistEntry& h = g_hist[g_histHead];
+  h.ms    = now;
+  h.pitch = g_settled ? g_pitch : g_instPitch;
+  h.roll  = g_settled ? g_roll  : g_instRoll;
+  h.temp  = g_imuTemp;
+  h.flags = (uint8_t)((g_settled ? 1 : 0) | (g_histEventLatch ? 2 : 0));
+  g_histEventLatch = false;
+  g_histHead = (g_histHead + 1) % HISTORY_LENGTH;
+  if (g_histCount < HISTORY_LENGTH) g_histCount++;
+}
+
+// =============================================================================
+// WiFi — soft-AP by default (zero infrastructure), station/hotspot optional
+// =============================================================================
+static void startAP() {
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
+  g_apMode = true;
+  g_ip = WiFi.softAPIP().toString();
+  g_dns.start(53, "*", WiFi.softAPIP());          // captive portal: all DNS -> us
+  Serial.printf("[WiFi] soft-AP '%s' %s at %s\n",
+                AP_SSID, ok ? "up" : "FAILED", g_ip.c_str());
+}
+
+static bool startSTA() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] joining '%s' ...\n", WIFI_SSID);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS)
+    delay(100);
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] station connect FAILED");
+    return false;
+  }
+  g_apMode = false;
+  g_ip = WiFi.localIP().toString();
+  // The hotspot normally has internet -> NTP; persisted to the RTC in wifiTick.
+  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+  if (MDNS.begin(MDNS_HOSTNAME)) MDNS.addService("http", "tcp", WEB_SERVER_PORT);
+  Serial.printf("[WiFi] connected, IP %s (http://%s.local/)\n",
+                g_ip.c_str(), MDNS_HOSTNAME);
+  return true;
+}
+
+static void setupWiFi() {
+  WiFi.persistent(false);
+  if (strlen(AP_PASS) < 8)
+    Serial.println("[WiFi] WARNING: AP_PASS shorter than 8 chars -> WPA2 soft-AP will fail");
+#if WIFI_MODE_SELECT == LOGGER_WIFI_STA
+  if (!startSTA()) g_ip = "0.0.0.0";
+#elif WIFI_MODE_SELECT == LOGGER_WIFI_AUTO
+  if (!startSTA()) startAP();
+#else
+  startAP();
+#endif
+  // QR content: WiFi-join string in AP mode (captive portal does the rest),
+  // dashboard URL in station mode (the phone is already on that network).
+  if (g_apMode) snprintf(g_qrText, sizeof(g_qrText), "WIFI:T:WPA;S:%s;P:%s;;", AP_SSID, AP_PASS);
+  else          snprintf(g_qrText, sizeof(g_qrText), "http://%s/", g_ip.c_str());
+}
+
+// Station upkeep (reconnect; one-time NTP -> RTC persist). Cheap, 1 Hz.
+static void wifiTick() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < 1000) return;
+  last = now;
+  if (g_apMode) return;
+  static uint32_t lastRetry = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastRetry >= WIFI_RECONNECT_INTERVAL_MS) { lastRetry = now; WiFi.reconnect(); }
+    return;
+  }
+  String ip = WiFi.localIP().toString();            // refresh after a reconnect:
+  if (ip != g_ip) {                                 // the DHCP lease may have changed
+    g_ip = ip;
+    snprintf(g_qrText, sizeof(g_qrText), "http://%s/", g_ip.c_str());
+    Serial.printf("[WiFi] IP now %s\n", g_ip.c_str());
+  }
+  if (!g_rtcSyncedFromNtp && timeIsValid()) {
+    time_t t = time(nullptr);
+    M5.Rtc.setDateTime(gmtime(&t));                 // BM8563 stores UTC
+    g_rtcSyncedFromNtp = true;
+    Serial.println("[RTC] set from NTP");
   }
 }
 
 // =============================================================================
-// Touch buttons (the only operator input — there is no web UI)
+// Web API + dashboard. SYNCHRONOUS WebServer: every handler below runs inside
+// loop() (g_http.handleClient()), so they may touch any global directly — the
+// async-task/spinlock plumbing of the old web build is deliberately gone.
+// =============================================================================
+static void jsonEscapeInto(String& out, const char* s) {
+  for (; *s; s++) {
+    char c = *s;
+    if (c == '"' || c == '\\')   { out += '\\'; out += c; }
+    else if ((uint8_t)c < 0x20)  out += ' ';
+    else                         out += c;
+  }
+}
+
+static String buildStatusJson() {
+  String j; j.reserve(1100);
+  char t[192];
+  time_t ep = time(nullptr);
+  snprintf(t, sizeof(t), "{\"up\":%lu,\"epoch\":%lld,\"clock\":%d,",
+           (unsigned long)millis(), (long long)(timeIsValid() ? ep : 0),
+           timeIsValid() ? 1 : 0);
+  j += t;
+  snprintf(t, sizeof(t),
+           "\"pitch\":%.4f,\"roll\":%.4f,\"ip\":%.4f,\"ir\":%.4f,\"dp\":%.4f,\"dr\":%.4f,",
+           g_pitch, g_roll, g_instPitch, g_instRoll, g_dispPitch, g_dispRoll);
+  j += t;
+  snprintf(t, sizeof(t), "\"settled\":%d,\"streak\":%d,\"n\":%d,\"nT\":%u,\"dwellMs\":%lu,",
+           g_settled ? 1 : 0, g_stationaryStreak, g_bufCount,
+           (unsigned)g_set.avgSamples, (unsigned long)g_set.dwellMs);
+  j += t;
+  snprintf(t, sizeof(t), "\"sig\":%.5f,\"gyro\":%.3f,\"sigTh\":%.5f,\"gyroTh\":%.3f,\"tol\":%.3f,",
+           g_accelSd, g_gyroMag, g_set.accelStdG, g_set.gyroThreshDps, g_set.levelTolDeg);
+  j += t;
+  snprintf(t, sizeof(t), "\"cal\":%d,\"ox\":%.5f,\"oy\":%.5f,\"calT\":",
+           g_calibrated ? 1 : 0, g_offX, g_offY);
+  j += t;
+  j += isNan(g_calTempC) ? String("null") : String(g_calTempC, 1);
+  snprintf(t, sizeof(t), ",\"cs\":\"%s\",\"cp\":%d,\"ce\":%d,\"cm\":\"",
+           calStepName(), calProgress(), g_calError ? 1 : 0);
+  j += t;
+  jsonEscapeInto(j, g_calResultMsg.c_str());
+  j += "\",\"temp\":";
+  j += isNan(g_imuTemp) ? String("null") : String(g_imuTemp, 2);
+  snprintf(t, sizeof(t), ",\"bat\":%d,\"chg\":%d,\"sd\":%d,\"sds\":\"",
+           g_battery, g_charging ? 1 : 0, g_sdOk ? 1 : 0);
+  j += t;
+  jsonEscapeInto(j, g_sdStatus.c_str());
+  j += "\",\"log\":"; j += (g_logging ? '1' : '0');
+  j += ",\"file\":\""; jsonEscapeInto(j, g_logName.c_str());
+  snprintf(t, sizeof(t), "\",\"rows\":%lu,\"ev\":%lu,\"evs\":[",
+           (unsigned long)g_rowsWritten, (unsigned long)g_eventCount);
+  j += t;
+  for (int i = 0; i < g_evCount; i++) {             // newest first
+    int idx = (g_evHead - 1 - i + 2 * EVENT_RING_LENGTH) % EVENT_RING_LENGTH;
+    snprintf(t, sizeof(t), "%s[%lu,\"", i ? "," : "", (unsigned long)g_events[idx].ms);
+    j += t;
+    jsonEscapeInto(j, g_events[idx].label);
+    j += "\"]";
+  }
+  snprintf(t, sizeof(t), "],\"wifi\":\"%s\",\"clients\":%d,\"rssi\":%d}",
+           g_apMode ? "AP" : "STA",
+           g_apMode ? (int)WiFi.softAPgetStationNum() : -1,
+           g_apMode ? 0 : (int)WiFi.RSSI());
+  j += t;
+  return j;
+}
+
+static String settingsJson() {
+  char t[300];
+  snprintf(t, sizeof(t),
+           "{\"gyroTh\":%.3f,\"sigTh\":%.5f,\"magTol\":%.3f,\"dwellMs\":%lu,\"avgN\":%u,"
+           "\"logMs\":%lu,\"logMove\":%d,\"moveMs\":%lu,\"tol\":%.3f,"
+           "\"psign\":%d,\"rsign\":%d,\"swap\":%d}",
+           g_set.gyroThreshDps, g_set.accelStdG, g_set.accelMagTolG,
+           (unsigned long)g_set.dwellMs, (unsigned)g_set.avgSamples,
+           (unsigned long)g_set.settledLogMs, g_set.logWhileMoving ? 1 : 0,
+           (unsigned long)g_set.movingLogMs, g_set.levelTolDeg,
+           g_set.pitchSign > 0 ? 1 : -1, g_set.rollSign > 0 ? 1 : -1,
+           g_set.swapPitchRoll ? 1 : 0);
+  return String(t);
+}
+
+// Trend backfill: entries as [ms,pitch,roll,temp|null,flags], oldest first.
+// Chunked so the ~900-entry worst case never needs one big RAM buffer.
+static void sendHistory() {
+  g_http.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  g_http.send(200, "application/json", "");
+  char t[80];
+  snprintf(t, sizeof(t), "{\"now\":%lu,\"e\":[", (unsigned long)millis());
+  String chunk = t; chunk.reserve(2300);
+  for (int i = 0; i < g_histCount; i++) {
+    int idx = (g_histHead - g_histCount + i + HISTORY_LENGTH) % HISTORY_LENGTH;
+    const HistEntry& h = g_hist[idx];
+    if (isNan(h.temp))
+      snprintf(t, sizeof(t), "%s[%lu,%.4f,%.4f,null,%u]",
+               i ? "," : "", (unsigned long)h.ms, h.pitch, h.roll, h.flags);
+    else
+      snprintf(t, sizeof(t), "%s[%lu,%.4f,%.4f,%.2f,%u]",
+               i ? "," : "", (unsigned long)h.ms, h.pitch, h.roll, h.temp, h.flags);
+    chunk += t;
+    if (chunk.length() > 2048) { g_http.sendContent(chunk); chunk = ""; }
+  }
+  chunk += "]}";
+  g_http.sendContent(chunk);
+  g_http.sendContent("");                           // terminate the chunked stream
+}
+
+// Phones probe these URLs to detect captive portals; redirecting them to the
+// dashboard makes the "sign in to network" sheet open it automatically.
+static void captiveRedirect() {
+  g_http.sendHeader("Location", String("http://") + g_ip + "/", true);
+  g_http.send(302, "text/plain", "");
+}
+
+static void setupWeb() {
+  g_http.on("/", HTTP_GET, []() { g_http.send_P(200, "text/html", WEB_PAGE_HTML); });
+
+  g_http.on("/api/status",  HTTP_GET, []() { g_http.send(200, "application/json", buildStatusJson()); });
+  g_http.on("/api/history", HTTP_GET, sendHistory);
+  g_http.on("/api/settings", HTTP_GET, []() { g_http.send(200, "application/json", settingsJson()); });
+
+  g_http.on("/api/settings", HTTP_POST, []() {
+    if (g_http.hasArg("reset")) {
+      settingsDefaults();
+      bufReset(); g_stationaryStreak = 0; g_settled = false;
+    } else {
+      uint16_t oldAvg = g_set.avgSamples;
+      if (g_http.hasArg("gyroTh"))  g_set.gyroThreshDps  = g_http.arg("gyroTh").toFloat();
+      if (g_http.hasArg("sigTh"))   g_set.accelStdG      = g_http.arg("sigTh").toFloat();
+      if (g_http.hasArg("magTol"))  g_set.accelMagTolG   = g_http.arg("magTol").toFloat();
+      if (g_http.hasArg("dwellMs")) g_set.dwellMs        = (uint32_t)g_http.arg("dwellMs").toInt();
+      if (g_http.hasArg("avgN"))    g_set.avgSamples     = (uint16_t)g_http.arg("avgN").toInt();
+      if (g_http.hasArg("logMs"))   g_set.settledLogMs   = (uint32_t)g_http.arg("logMs").toInt();
+      if (g_http.hasArg("logMove")) g_set.logWhileMoving = g_http.arg("logMove").toInt() != 0;
+      if (g_http.hasArg("moveMs"))  g_set.movingLogMs    = (uint32_t)g_http.arg("moveMs").toInt();
+      if (g_http.hasArg("tol"))     g_set.levelTolDeg    = g_http.arg("tol").toFloat();
+      if (g_http.hasArg("psign"))   g_set.pitchSign      = g_http.arg("psign").toFloat();
+      if (g_http.hasArg("rsign"))   g_set.rollSign       = g_http.arg("rsign").toFloat();
+      if (g_http.hasArg("swap"))    g_set.swapPitchRoll  = g_http.arg("swap").toInt() != 0;
+      settingsSanitize();
+      if (g_set.avgSamples != oldAvg) {             // window changed -> restart the average
+        bufReset(); g_stationaryStreak = 0; g_settled = false;
+      }
+    }
+    settingsSanitize();
+    settingsSave();
+    g_http.send(200, "application/json", settingsJson());
+  });
+
+  g_http.on("/api/mark", HTTP_POST, []() {
+    String label = g_http.arg("label");
+    label.trim();
+    if (label.length() > 31) label = label.substring(0, 31);
+    for (size_t i = 0; i < label.length(); i++) {   // keep CSV/JSON trivially safe
+      char c = label[i];
+      if (c == '"' || c == '\\' || (uint8_t)c < 0x20) label.setCharAt(i, '\'');
+    }
+    if (!label.length()) label = "web-mark";
+    markEvent(label);
+    g_http.send(200, "application/json",
+                String("{\"ok\":1,\"ev\":") + String(g_eventCount) + "}");
+  });
+
+  g_http.on("/api/log", HTTP_POST, []() {
+    String a = g_http.arg("action");
+    if      (a == "start" && !g_logging) toggleLogging();
+    else if (a == "stop"  &&  g_logging) toggleLogging();
+    g_http.send(200, "application/json",
+                String("{\"ok\":1,\"log\":") + (g_logging ? "1" : "0") + "}");
+  });
+
+  g_http.on("/api/cal", HTTP_POST, []() {
+    String a = g_http.arg("action");
+    if      (a == "start" && g_calStep == CAL_IDLE) { g_showQr = false; calibStart(); }
+    else if (a == "next")                           calibAdvance();
+    else if (a == "cancel")                         calibCancel();
+    g_http.send(200, "application/json",
+                String("{\"ok\":1,\"cs\":\"") + calStepName() + "\"}");
+  });
+
+  g_http.on("/api/time", HTTP_POST, []() {
+    long long ep = atoll(g_http.arg("epoch").c_str());
+    if (ep > (long long)TIME_VALID_EPOCH && ep < 4102444800LL) {  // ..year 2100
+      struct timeval tv = { (time_t)ep, 0 };
+      settimeofday(&tv, nullptr);
+      time_t tt = (time_t)ep;
+      M5.Rtc.setDateTime(gmtime(&tt));              // BM8563 stores UTC
+      Serial.printf("[RTC] set from phone (epoch %lld)\n", ep);
+      g_http.send(200, "application/json", "{\"ok\":1}");
+    } else {
+      g_http.send(400, "application/json", "{\"ok\":0,\"err\":\"bad epoch\"}");
+    }
+  });
+
+  static const char* probes[] = {
+    "/generate_204", "/gen_204",                    // Android
+    "/hotspot-detect.html", "/library/test/success.html", // iOS / macOS
+    "/connecttest.txt", "/ncsi.txt",                // Windows
+    "/success.txt", "/canonical.html"
+  };
+  for (auto p : probes) g_http.on(p, captiveRedirect);
+  g_http.onNotFound(captiveRedirect);
+
+  g_http.begin();
+  Serial.printf("[WEB] dashboard at http://%s/\n", g_ip.c_str());
+}
+
+// =============================================================================
+// Touch buttons (operator input on the device; the phone dashboard mirrors them)
 // -----------------------------------------------------------------------------
 //  Normal mode buttons:  CAL (tap = start calibration, HOLD = clear calibration)
 //                        MARK (log an event row), LOG (start/stop logging).
+//  Top strip:            tap = "connect your phone" QR overlay.
 //  Calibration wizard:   NEXT (advance / finish), CANCEL.
 // =============================================================================
 static void handleTouch() {
@@ -622,6 +1130,12 @@ static void handleTouch() {
   // zero active touches, and we need wasReleased() there. getDetail(0) is valid.
   auto t = M5.Touch.getDetail();
   int x = t.x, y = t.y;
+
+  // ---- QR overlay: any tap closes it ------------------------------------------
+  if (g_showQr) {
+    if (t.wasReleased()) g_showQr = false;
+    return;
+  }
 
   // ---- calibration wizard: act on release over a button ----------------------
   if (g_calStep != CAL_IDLE) {
@@ -647,7 +1161,8 @@ static void handleTouch() {
 
   // ---- normal mode: taps act on release --------------------------------------
   if (t.wasReleased()) {
-    if      (hit(x, y, g_btn[0])) { if (!calCleared) calibStart(); } // CAL (tap)
+    if      (y < 24)              g_showQr = true;                   // top strip -> QR
+    else if (hit(x, y, g_btn[0])) { if (!calCleared) calibStart(); } // CAL (tap)
     else if (hit(x, y, g_btn[1])) markEvent("device-button");        // MARK
     else if (hit(x, y, g_btn[2])) toggleLogging();                   // LOG
   }
@@ -706,6 +1221,41 @@ static void drawCalScreen() {
   drawBtn(g_btnCalCancel, "CANCEL", TFT_MAROON);
 }
 
+// "Connect your phone" overlay (tap the top strip to open, tap anywhere to
+// close). In AP mode the QR is a standard WIFI: join string — scanning it joins
+// the soft-AP and the captive portal then opens the dashboard by itself. In
+// station mode the phone is already on the same network, so the QR is the URL.
+static void drawQrScreen() {
+  auto& cv = g_canvas;
+  cv.fillSprite(TFT_BLACK);
+  cv.setTextSize(1); cv.setTextColor(TFT_CYAN);
+  cv.drawString("CONNECT YOUR PHONE", 8, 6);
+
+  const int qs = 150, qx = 12, qy = 28;
+  cv.fillRect(qx - 5, qy - 5, qs + 10, qs + 10, TFT_WHITE);  // quiet zone
+  cv.qrcode(g_qrText, qx, qy, qs);
+
+  int tx = qx + qs + 16, ty = 32;
+  cv.setTextColor(TFT_WHITE);
+  if (g_apMode) {
+    cv.drawString("1. Scan to join", tx, ty);              ty += 14;
+    cv.setTextColor(TFT_DARKGREY);
+    cv.drawString(AP_SSID, tx + 8, ty);                    ty += 12;
+    cv.drawString((String("pw ") + AP_PASS).c_str(), tx + 8, ty); ty += 18;
+    cv.setTextColor(TFT_WHITE);
+    cv.drawString("2. Dashboard pops", tx, ty);            ty += 12;
+    cv.drawString("   up - or open:", tx, ty);             ty += 16;
+  } else {
+    cv.drawString("Scan to open the", tx, ty);             ty += 12;
+    cv.drawString("dashboard:", tx, ty);                   ty += 16;
+  }
+  cv.setTextColor(TFT_GREEN);
+  cv.drawString((String("http://") + g_ip + "/").c_str(), tx, ty);
+  cv.setTextColor(TFT_DARKGREY);
+  cv.drawString("tap anywhere to close", 12, 224);
+  cv.pushSprite(0, 0);
+}
+
 // Auto-ranging full-scale (degrees at the rim) for the bubble, with hysteresis
 // so the chosen step is stable. Mutates a static index -> call once per frame.
 static float bubbleFullScaleDeg() {
@@ -732,7 +1282,7 @@ static void drawBubbleLevel(int cx, int cy, int R, float scaleDeg) {
   cv.drawFastVLine(cx, cy - R, 2 * R, faint);
 
   // centre "level" tolerance ring (kept visible even at the finest scale)
-  int tolR = (int)((LEVEL_TOLERANCE_DEG / scaleDeg) * R);
+  int tolR = (int)((g_set.levelTolDeg / scaleDeg) * R);
   if (tolR < 7) tolR = 7;
   cv.drawCircle(cx, cy, tolR, TFT_DARKGREEN);
 
@@ -745,8 +1295,8 @@ static void drawBubbleLevel(int cx, int cy, int R, float scaleDeg) {
   int bx = cx + (int)(nx * (R - br));
   int by = cy - (int)(ny * (R - br));                // screen Y is down -> negate
 
-  bool level = (fabsf(g_dispPitch) <= LEVEL_TOLERANCE_DEG &&
-                fabsf(g_dispRoll)  <= LEVEL_TOLERANCE_DEG);
+  bool level = (fabsf(g_dispPitch) <= g_set.levelTolDeg &&
+                fabsf(g_dispRoll)  <= g_set.levelTolDeg);
   cv.fillCircle(bx, by, br, level ? TFT_GREEN : TFT_CYAN);
   cv.drawCircle(bx, by, br, TFT_WHITE);
   cv.fillCircle(bx - 4, by - 4, 3, TFT_WHITE);       // glossy highlight
@@ -772,10 +1322,17 @@ static void updateDisplay() {
   int W = cv.width();
 
   if (g_calStep != CAL_IDLE) { drawCalScreen(); cv.pushSprite(0, 0); return; }
+  if (g_showQr)              { drawQrScreen(); return; }   // pushes its own sprite
 
-  // ---- top strip: title + battery -------------------------------------------
+  // ---- top strip: title + WiFi info (tap this strip for the QR) + battery ----
   cv.setTextSize(1); cv.setTextColor(TFT_CYAN);
   cv.drawString("BUBBLE LEVEL", 6, 4);
+  char ws[40];
+  if (g_apMode)                                snprintf(ws, sizeof(ws), "[QR] AP %s (%d)", g_ip.c_str(), WiFi.softAPgetStationNum());
+  else if (WiFi.status() == WL_CONNECTED)      snprintf(ws, sizeof(ws), "[QR] %s", g_ip.c_str());
+  else                                         snprintf(ws, sizeof(ws), "[QR] no wifi");
+  cv.setTextColor(TFT_DARKGREY);
+  cv.drawString(ws, 92, 4);
   char bs[20]; snprintf(bs, sizeof(bs), "BAT %d%%%s", g_battery, g_charging ? "+" : "");
   cv.setTextColor(g_battery >= 0 && g_battery < 20 ? TFT_RED : TFT_WHITE);
   cv.drawString(bs, W - 6 - cv.textWidth(bs), 4);
@@ -860,18 +1417,25 @@ void setup() {
 
   measureGyroBias();                // ~2 s, device must be still
   loadCalibration();                // NVS offsets (or UNCALIBRATED)
+  settingsLoad();                   // NVS runtime settings (or factory defaults)
 
   // --- clock: use the battery-backed BM8563 RTC if it holds a valid time -----
-  //  There is no NTP (no WiFi), so timestamps are real only if the RTC was set
-  //  beforehand (e.g. by M5Burner). Otherwise filenames fall back to an index
-  //  and timestamp_iso is logged as NO_TIME — the millis column is always valid.
+  //  Timestamps are real if the RTC was ever set — by the dashboard's "Sync
+  //  clock from phone" button, by NTP (station mode), or externally (M5Burner).
+  //  Otherwise filenames fall back to an index and timestamp_iso is logged as
+  //  NO_TIME — the millis column is always valid.
   setenv("TZ", TZ_INFO, 1); tzset();
   M5.Rtc.setSystemTimeFromRtc();    // no-op if the RTC was never set
 
   // --- microSD: open the log file; start logging if a card is present -------
   if (openLog()) g_logging = true;
 
-  Serial.println("[BOOT] done (standalone, no networking).");
+  // --- WiFi + phone dashboard (soft-AP by default; QR overlay via top strip) -
+  bootBanner("Starting WiFi...", "", TFT_CYAN);
+  setupWiFi();
+  setupWeb();
+
+  Serial.println("[BOOT] done. Tap the top strip for the connect-QR.");
 }
 
 void loop() {
@@ -885,20 +1449,27 @@ void loop() {
     if (g_imuOk) imuSampleTick();
   }
 
-  // 2) calibration capture completion
+  // 2) phone dashboard: captive-portal DNS + HTTP. The handlers run HERE, in
+  //    loop() context (synchronous WebServer) — no cross-task state sharing.
+  if (g_apMode) g_dns.processNextRequest();
+  g_http.handleClient();
+  wifiTick();
+
+  // 3) calibration capture completion
   calibrationTick();
 
-  // 3) on-screen touch buttons (the only operator input)
+  // 4) on-screen touch buttons
   handleTouch();
 
-  // 4) CSV logging cadence (settled rows; events are immediate)
+  // 5) CSV logging cadence (settled rows; events are immediate) + trend history
   loggingTick();
+  historyTick();
 
-  // 5) screen refresh (live bubble level)
+  // 6) screen refresh (live bubble level)
   static uint32_t lastDisp = 0;
   if (now - lastDisp >= DISPLAY_INTERVAL_MS) { lastDisp = now; updateDisplay(); }
 
-  // 6) cached battery/charging read (kept off the 100 Hz hot path)
+  // 7) cached battery/charging read (kept off the 100 Hz hot path)
   static uint32_t lastBat = 0;
   if (now - lastBat >= BATTERY_READ_INTERVAL_MS) {
     lastBat = now;
