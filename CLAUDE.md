@@ -8,7 +8,7 @@ offline evaluation tooling under `tools/`.
 All user-facing output — HTML reports, dashboards, plots, GUIs — follows
 the **classic Leica** design doctrine in `docs/DESIGN.md` (white/graphite/
 hairline greys, Leica red `#DA291C` as the only accent, Helvetica stack,
-logo slot at `tools/assets/leica_logo.*`). This is a deliberate owner
+logo slot at `tools/assets/` — any svg/png/jpg). This is a deliberate owner
 decision and supersedes the Hexagon Nova design system for this project
 family. Do not introduce new colours or fonts outside the doctrine;
 `tools/evaluate_level_log.py` (`LEICA` dict, `CSS` block) is the reference

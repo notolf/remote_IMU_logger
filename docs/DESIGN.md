@@ -9,9 +9,10 @@ deliberately use the classic Leica look.
 ## 1. Identity
 
 - **Logo**: the official Leica Geosystems logo (red script wordmark).
-  Tools embed the asset from `tools/assets/leica_logo.svg|png|jpg` when
-  present and fall back to a typographic wordmark otherwise — never
-  redraw, recolour, stretch, or approximate the script lettering.
+  Tools embed any svg/png/jpg image found in `tools/assets/`
+  (`leica_logo.*` preferred when several exist) and fall back to a
+  typographic wordmark otherwise — never redraw, recolour, stretch, or
+  approximate the script lettering.
   Obtain the asset from the internal brand portal. Think before
   committing it to a public repository; the embed-from-disk slot exists
   so the binary never *needs* to be committed.

@@ -136,23 +136,35 @@ SELECTION_COLORS = ["#DA291C", "#1A1A1A", "#3A6EA5", "#2E7D32", "#7D4B9E",
 
 
 def find_logo():
-    """Official Leica Geosystems logo, embedded when present. Drop the asset
-    (from the brand portal) at tools/assets/leica_logo.svg|png|jpg — reports
-    pick it up automatically; otherwise a typographic wordmark is used."""
+    """Official Leica Geosystems logo, embedded when present. Any svg/png/jpg
+    dropped into tools/assets/ is picked up (e.g. Leica_Geosystems.png);
+    'leica_logo.*' wins if several exist, then names containing 'leica' or
+    'logo'. Falls back to a typographic wordmark when nothing is found."""
+    import glob
     here = os.path.dirname(os.path.abspath(__file__))
-    for d in (os.path.join(here, "assets"), here):
-        for n in ("leica_logo.svg", "leica_logo.png", "leica_logo.jpg"):
-            p = os.path.join(d, n)
-            if os.path.exists(p):
-                return p
-    return None
+    cands = []
+    for in_assets, d in ((True, os.path.join(here, "assets")), (False, here)):
+        for p in sorted(glob.glob(os.path.join(d, "*.*"))):
+            ext = p.rsplit(".", 1)[-1].lower()
+            if ext not in ("svg", "png", "jpg", "jpeg"):
+                continue
+            name = os.path.basename(p).lower()
+            rank = (0 if name.startswith("leica_logo.") else
+                    1 if ("leica" in name or "logo" in name) else 2)
+            if rank == 2 and not in_assets:
+                continue              # next to the script, only clear logo names
+            cands.append((rank, p))
+        if cands:
+            break
+    return min(cands)[1] if cands else None
 
 
 def logo_html():
     p = find_logo()
     if p:
+        ext = p.rsplit(".", 1)[-1].lower()
         mime = {"svg": "image/svg+xml", "png": "image/png",
-                "jpg": "image/jpeg"}[p.rsplit(".", 1)[1]]
+                "jpg": "image/jpeg", "jpeg": "image/jpeg"}[ext]
         b64 = base64.b64encode(open(p, "rb").read()).decode("ascii")
         return (f'<img class=logo src="data:{mime};base64,{b64}" '
                 'alt="Leica Geosystems">')
