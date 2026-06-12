@@ -43,6 +43,7 @@ import os
 import subprocess
 import sys
 import datetime as _dt
+from html import escape as html_escape
 
 
 def _ensure_deps():
@@ -387,8 +388,25 @@ def eval_selection(df, dwells, t0, t1, settled_only=True, meas_s=MEAS_DURATION_S
     out["off_y_mg"] = float(oy.mean() * 1000.0)
     out["events"] = [(float(r["t_s"]), str(r["event_label"]))
                      for _, r in sel[sel["event_flag"] == 1].iterrows()]
+    # selections inherit the flag label(s) marked inside them (dashboard
+    # "mark" button) — that name follows the measurement through the report
+    names = []
+    for _t, lbl in out["events"]:
+        s = str(lbl).strip()
+        if s and s not in names:
+            names.append(s)
+    out["name"] = " / ".join(names)
     out["dwell_table"] = dsel
     return out
+
+
+def sel_label(k, res, maxlen=22):
+    """Display name of a selection: 'S3 Tray Cabinet' when a flag was marked
+    inside it, plain 'S3' otherwise."""
+    nm = res.get("name", "")
+    if len(nm) > maxlen:
+        nm = nm[:maxlen - 1] + "…"
+    return f"S{k+1} {nm}".strip()
 
 
 # -----------------------------------------------------------------------------
@@ -551,7 +569,8 @@ def plot_2d(df, results, ranges):
                    alpha=0.30, lw=0)
         low_n = " *" if res["warnings"] else ""   # ASCII: ⚠ is tofu in many fonts
         ax.scatter([cx], [cy], s=70, color=col, marker="+", lw=1.8,
-                   label=f"S{k+1}  R95 {r95*1000:.1f} m° (n={res['n_used']}){low_n}")
+                   label=f"{sel_label(k, res)}  R95 {r95*1000:.1f} m° "
+                         f"(n={res['n_used']}){low_n}")
         ax.add_patch(Circle((cx, cy), r95 * mag, fill=False, color=col,
                             ls="--", lw=1.4))
     ax.set_xlim(-lim, lim)
@@ -664,10 +683,11 @@ def selection_table_html(results):
     for k, r in enumerate(results):
         col = SELECTION_COLORS[k % len(SELECTION_COLORS)]
         dot = f"<span class=dot style=background:{col}></span>"
+        label = html_escape(sel_label(k, r))
         for w in r["warnings"]:
-            warnboxes.append(f"<div class=warnbox>⚠ S{k+1} — {w}</div>")
+            warnboxes.append(f"<div class=warnbox>⚠ {label} — {w}</div>")
         if not r.get("valid"):
-            rows.append(f"<tr><td>{dot}<b>S{k+1}</b></td><td colspan=6>"
+            rows.append(f"<tr><td>{dot}<b>{label}</b></td><td colspan=6>"
                         f"too few settled samples ({r['n_used']}/{r['n_total']})</td></tr>")
             continue
         flag = " ⚠" if r["warnings"] else ""
@@ -675,7 +695,7 @@ def selection_table_html(results):
             a = r[axn]
             rows.append(
                 "<tr>"
-                + (f"<td rowspan=2>{dot}<b>S{k+1}</b>{flag}<br><span class=note>"
+                + (f"<td rowspan=2>{dot}<b>{label}</b>{flag}<br><span class=note>"
                    f"{r['dur_s']:.0f} s · n={r['n_used']}</span></td>"
                    if axn == "pitch" else "")
                 + f"<td>{axn}</td>"
@@ -715,8 +735,9 @@ def build_report(args, df, sessions, dwells, ranges, results, imgs, allan_info,
 
     tiles = ""
     if valid:
-        r0 = valid[0]
-        many = f" (S1 of {len(valid)})" if len(valid) > 1 else ""
+        k0, r0 = next((k, r) for k, r in enumerate(results) if r.get("valid"))
+        nm = html_escape(sel_label(k0, r0, maxlen=14))
+        many = f" ({nm} of {len(valid)})" if len(valid) > 1 else ""
         tiles += tile("Pitch" + many, f"{r0['pitch']['mean']:+.3f}°",
                       f"σ {r0['pitch']['std']*1000:.1f} m°")
         tiles += tile("Roll" + many, f"{r0['roll']['mean']:+.3f}°",
@@ -737,7 +758,8 @@ def build_report(args, df, sessions, dwells, ranges, results, imgs, allan_info,
     for k, r in enumerate(results):
         if r.get("valid") and r.get("n_dwells", 0) >= 2:
             repeat_html += (
-                f"<p class=note>S{k+1} repeatability over {r['n_dwells']} placements: "
+                f"<p class=note>{html_escape(sel_label(k, r))} repeatability over "
+                f"{r['n_dwells']} placements: "
                 f"pitch σ <b>{r['repeat_pitch_std']*1000:.2f} m°</b>, "
                 f"roll σ <b>{r['repeat_roll_std']*1000:.2f} m°</b></p>")
 
@@ -991,12 +1013,13 @@ def main():
 
     for k, r in enumerate(results):                      # console summary
         if r.get("valid"):
-            print(f"  S{k+1}: pitch {r['pitch']['mean']:+.3f}° σ{r['pitch']['std']*1000:.2f} m° "
-                  f"({r['pitch']['std_um']:.1f} µm) | roll {r['roll']['mean']:+.3f}° "
-                  f"σ{r['roll']['std']*1000:.2f} m° ({r['roll']['std_um']:.1f} µm) | "
+            print(f"  {sel_label(k, r)}: pitch {r['pitch']['mean']:+.3f}° "
+                  f"σ{r['pitch']['std']*1000:.2f} m° ({r['pitch']['std_um']:.1f} µm) | "
+                  f"roll {r['roll']['mean']:+.3f}° σ{r['roll']['std']*1000:.2f} m° "
+                  f"({r['roll']['std_um']:.1f} µm) | "
                   f"CoC R95 {r['coc_r95']*1000:.1f} m° | n={r['n_used']}")
         for w in r["warnings"]:
-            print(f"  ⚠ S{k+1}: {w}")
+            print(f"  ⚠ {sel_label(k, r)}: {w}")
 
 
 if __name__ == "__main__":
