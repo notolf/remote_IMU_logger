@@ -66,9 +66,11 @@ spent on identity and the most important figure, not decoration.
 - **Gap honesty**: never bridge time gaps with interpolated lines —
   insert NaNs so missing data shows as missing.
 - **Uncertainty is always visible**: every measurement aggregate carries
-  a circle of confusion (R95). If the overview scale makes it sub-pixel,
-  per-selection detail panels at true scale are mandatory. Never inflate
-  an indicator to make it visible.
+  a circle of confusion (R95) around its marker, in the same graph. When
+  true scale would be sub-pixel, draw the circles at a round magnification
+  factor and state it in the legend (surveying error-ellipse convention)
+  — never magnify silently, and keep tolerance/target circles at true
+  scale.
 - **Sample-size guards**: measurements below the required duration
   (default 30 s) or below n = 20 settled samples are flagged everywhere
   they appear (console, hero chip, tables, plot legends). Plots use an

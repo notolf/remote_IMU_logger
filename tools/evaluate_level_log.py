@@ -481,36 +481,67 @@ def plot_timeseries(df, dwells, ranges):
     return fig_to_b64(fig)
 
 
+def _nice_mag(x):
+    """Largest 1, 2 or 5 ×10^k not exceeding x; at least 1. Used to pick a
+    round magnification factor for the uncertainty circles."""
+    if x <= 1:
+        return 1.0
+    e = math.floor(math.log10(x))
+    for m in (5.0, 2.0, 1.0):
+        if m * 10 ** e <= x:
+            return m * 10 ** e
+    return 1.0
+
+
 def plot_2d(df, results, ranges):
+    """Single pitch-vs-roll plot. Every measurement mean (+) carries its R95
+    circle of confusion. The axis range is set by the distance between
+    locations, so a few-m° radius is sub-pixel at true scale — the circles
+    are drawn at a round magnification factor M (legend states it; the
+    surveying convention for error ellipses on network plots). The target
+    circle stays at true scale."""
     fig, ax = plt.subplots(figsize=(7.4, 7.4))
     fig.patch.set_facecolor(LEICA["card"])
     style_axes(ax)
     ax.axhline(0, color=LEICA["outvar"], lw=0.8)
     ax.axvline(0, color=LEICA["outvar"], lw=0.8)
-    ax.add_patch(Circle((0, 0), TARGET_DEG, fill=False, color=LEICA["success"],
-                        lw=1.4, label=f"target ±{TARGET_DEG:g}°"))
+
+    items = []
     lim = TARGET_DEG * 1.4
     for k, ((a, b), res) in enumerate(zip(ranges, results)):
         if not res.get("valid"):
             continue
         sel = df[(df["t_s"] >= a) & (df["t_s"] <= b)]
         used = sel[sel["settled"] == 1] if res["settled_only"] else sel
-        col = SELECTION_COLORS[k % len(SELECTION_COLORS)]
+        items.append((k, used, res))
         x, y = used["roll_deg"].to_numpy(), used["pitch_deg"].to_numpy()
-        cx, cy, r95 = res["roll"]["mean"], res["pitch"]["mean"], res["coc_r95"]
-        ax.scatter(x, y, s=4, color=col, alpha=0.30, lw=0)
-        low_n = " *" if res["warnings"] else ""   # ASCII: ⚠ is tofu in many fonts
-        ax.scatter([cx], [cy], s=70, color=col, marker="+", lw=1.8,
-                   label=f"S{k+1}  R95 {r95*1000:.1f} m° (n={len(x)}){low_n}")
-        # circle of confusion: 95 % of the samples fall inside the dashed ring
-        ax.add_patch(Circle((cx, cy), r95, fill=False, color=col, ls="--", lw=1.3))
-        dsel = res.get("dwell_table")
-        if dsel is not None and len(dsel):
-            ax.scatter(dsel["roll_mean"], dsel["pitch_mean"], s=26, marker="o",
-                       facecolors="none", edgecolors=col, lw=1.2)
         lim = max(lim, np.percentile(np.abs(x), 99.5) * 1.3,
                   np.percentile(np.abs(y), 99.5) * 1.3,
-                  (abs(cx) + r95) * 1.15, (abs(cy) + r95) * 1.15)
+                  abs(res["roll"]["mean"]) * 1.25, abs(res["pitch"]["mean"]) * 1.25)
+
+    # magnify the median R95 to ~6 % of the half-range, but never let the
+    # largest circle dominate the plot
+    mag = 1.0
+    if items:
+        r95s = np.array([res["coc_r95"] for _, _, res in items])
+        mag = _nice_mag(0.06 * lim / max(np.median(r95s), 1e-9))
+        while mag > 1 and r95s.max() * mag > 0.45 * lim:
+            mag = _nice_mag(mag / 1.5)
+        lim = max(lim, *(max(abs(res["roll"]["mean"]), abs(res["pitch"]["mean"]))
+                         + res["coc_r95"] * mag * 1.15 for _, _, res in items))
+
+    ax.add_patch(Circle((0, 0), TARGET_DEG, fill=False, color=LEICA["success"],
+                        lw=1.4, label=f"target ±{TARGET_DEG:g}° (true scale)"))
+    for k, used, res in items:
+        col = SELECTION_COLORS[k % len(SELECTION_COLORS)]
+        cx, cy, r95 = res["roll"]["mean"], res["pitch"]["mean"], res["coc_r95"]
+        ax.scatter(used["roll_deg"], used["pitch_deg"], s=4, color=col,
+                   alpha=0.30, lw=0)
+        low_n = " *" if res["warnings"] else ""   # ASCII: ⚠ is tofu in many fonts
+        ax.scatter([cx], [cy], s=70, color=col, marker="+", lw=1.8,
+                   label=f"S{k+1}  R95 {r95*1000:.1f} m° (n={res['n_used']}){low_n}")
+        ax.add_patch(Circle((cx, cy), r95 * mag, fill=False, color=col,
+                            ls="--", lw=1.4))
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal")
@@ -526,60 +557,11 @@ def plot_2d(df, results, ranges):
     sy.set_ylabel(f"displacement over {PLATE_ALONG_PITCH_MM:g} mm [µm]", fontsize=8, color=LEICA["onvar"])
     sx.tick_params(colors=LEICA["onvar"], labelsize=7)
     sy.tick_params(colors=LEICA["onvar"], labelsize=7)
-    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
-    ax.set_title("2-D tilt — circle of confusion (dashed, R95) per selection; "
-                 "+ mean, ○ dwell means", fontsize=10)
-    return fig_to_b64(fig)
-
-
-def plot_2d_details(df, results, ranges):
-    """One small panel per valid selection, in residual coordinates (deviation
-    from the selection mean, m°). The overview plot's axis range is set by the
-    distance BETWEEN locations, so a few-m° circle of confusion is smaller
-    than a pixel there; at true scale per selection it surrounds the points."""
-    items = [(k, ab, r) for k, (ab, r) in enumerate(zip(ranges, results))
-             if r.get("valid")]
-    if not items:
-        return None
-    nc = min(3, len(items))
-    nr = -(-len(items) // nc)
-    fig, axes = plt.subplots(nr, nc, figsize=(3.6 * nc + 0.6, 3.6 * nr + 0.3))
-    fig.patch.set_facecolor(LEICA["card"])
-    axes = np.atleast_1d(axes).ravel()
-    for ax in axes[len(items):]:
-        ax.set_visible(False)
-    for ax, (k, (a, b), res) in zip(axes, items):
-        sel = df[(df["t_s"] >= a) & (df["t_s"] <= b)]
-        used = sel[sel["settled"] == 1] if res["settled_only"] else sel
-        col = SELECTION_COLORS[k % len(SELECTION_COLORS)]
-        cx, cy, r95 = res["roll"]["mean"], res["pitch"]["mean"], res["coc_r95"]
-        rx = (used["roll_deg"].to_numpy() - cx) * 1000.0
-        ry = (used["pitch_deg"].to_numpy() - cy) * 1000.0
-        style_axes(ax)
-        ax.axhline(0, color=LEICA["outvar"], lw=0.8)
-        ax.axvline(0, color=LEICA["outvar"], lw=0.8)
-        ax.scatter(rx, ry, s=7, color=col, alpha=0.40, lw=0)
-        ax.scatter([0], [0], s=60, color=col, marker="+", lw=1.6)
-        ax.add_patch(Circle((0, 0), r95 * 1000.0, fill=False, color=col,
-                            ls="--", lw=1.4))
-        dsel = res.get("dwell_table")
-        if dsel is not None and len(dsel):
-            ax.scatter((dsel["roll_mean"] - cx) * 1000.0,
-                       (dsel["pitch_mean"] - cy) * 1000.0, s=30, marker="o",
-                       facecolors="none", edgecolors=col, lw=1.1)
-        lim = max(r95 * 1000.0 * 1.4,
-                  float(np.max(np.abs(np.concatenate([rx, ry])))) * 1.15
-                  if len(rx) else 1.0, 1.0)
-        ax.set_xlim(-lim, lim)
-        ax.set_ylim(-lim, lim)
-        ax.set_aspect("equal")
-        warn = " *" if res["warnings"] else ""
-        ax.set_title(f"S{k+1} — R95 {r95*1000:.1f} m°{warn}", fontsize=9,
-                     color=col, fontweight="bold")
-        ax.tick_params(labelsize=7)
-        ax.set_xlabel("Δroll [m°]", fontsize=8)
-        ax.set_ylabel("Δpitch [m°]", fontsize=8)
-    fig.tight_layout()
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.9,
+              title=("uncertainty circles ×%g" % mag) if mag > 1
+              else "uncertainty circles, true scale", title_fontsize=8)
+    ax.set_title("2-D tilt — each measurement (+) with its R95 circle of confusion",
+                 fontsize=10)
     return fig_to_b64(fig)
 
 
@@ -819,14 +801,11 @@ displacement across the plate ({PLATE_ALONG_PITCH_MM:g} mm pitch /
 
 <h2>2-D tilt</h2>
 <div class=card><img src="data:image/png;base64,{imgs['2d']}">
-<p class=note>Overview: dashed ring = circle of confusion (R95: 95 % of the
-selection's samples fall inside it) — often smaller than a pixel at this scale.
-Green circle = ±{TARGET_DEG:g}° target. Secondary axes: height displacement
-across the plate. * = below the required measurement time / sample size.</p>
-{f'<img src="data:image/png;base64,{imgs["2ddet"]}" style="margin-top:10px">'
- f'<p class=note>Detail per selection at true scale — the dashed R95 ring is the '
- f'measurement uncertainty around the mean (+); ○ = individual placements.</p>'
- if imgs.get("2ddet") else ''}</div>
+<p class=note>Each measurement (+) is surrounded by its dashed R95 circle of
+confusion (95 % of its samples fall inside). The circles are drawn at the
+magnification stated in the legend so a few-m° uncertainty stays visible on
+degree-scale axes — true radii in the legend, green ±{TARGET_DEG:g}° target at
+true scale. * = below the required measurement time / sample size.</p></div>
 
 <h2>Selections</h2>
 <div class=card>{selection_table_html(results)}{repeat_html}</div>
@@ -983,8 +962,7 @@ def main():
                for a, b in ranges]
 
     imgs = {"ts": plot_timeseries(df, dwells, ranges),
-            "2d": plot_2d(df, results, ranges),
-            "2ddet": plot_2d_details(df, results, ranges)}
+            "2d": plot_2d(df, results, ranges)}
     run, dt = longest_settled_run(df)
     allan_info = plot_allan(run, dt) if run is not None else None
     if allan_info is None:
