@@ -101,36 +101,62 @@ ALLAN_MIN_PTS = 60       # minimum points in a contiguous settled run for Allan
 MEAS_DURATION_S = 30.0   # required measurement time (CLI --meas-duration)
 MEAS_MIN_N      = 20     # minimum settled samples for trustworthy statistics
 
-# NOVA (Hexagon / Leica Geosystems design system) — light-mode sys.palette
-NOVA = {
-    "primary":  "#005198",  # sys.palette.primary            (pitch)
-    "info":     "#33B4F2",  # sys.palette.info               (roll)
-    "success":  "#6DBD55",  # sys.palette.success
-    "warning":  "#F19724",  # sys.palette.warning            (temperature)
-    "error":    "#BC1C1C",  # sys.palette.error
-    "on":       "#121623",  # sys.palette.onSurface
-    "onvar":    "#646E78",  # sys.palette.onSurfaceVariant
-    "surface":  "#F8FAFD",  # sys.palette.surface
-    "card":     "#FFFFFF",  # sys.palette.surfaceContainer
-    "surflow":  "#F5F7FA",  # sys.palette.surfaceContainerLow
-    "outline":  "#858C99",  # sys.palette.outline
-    "outvar":   "#E6EAF0",  # sys.palette.outlineVariant
-    "brand":    "#83C410",  # sys.palette.tertiary
-    "okbg":     "#E2FAD5",  # sys.palette.successContainer
-    "warnbg":   "#FEECD1",  # sys.palette.warningContainer
-    "warntx":   "#8E5515",  # text tone on warningContainer
-    "oktx":     "#28721E",  # text tone on successContainer
+# Classic Leica palette — project design doctrine, see docs/DESIGN.md.
+# White surfaces, hairline grey rules, graphite text, Leica red (Pantone 485C)
+# as THE accent. Functional colours (success/warning) stay muted and rare.
+LEICA = {
+    "brand":    "#DA291C",  # Leica red (Pantone 485 C)
+    "pitch":    "#DA291C",  # pitch series = brand red
+    "roll":     "#1A1A1A",  # roll series = graphite
+    "temp":     "#C77B00",  # temperature series = muted amber
+    "success":  "#2E7D32",
+    "warning":  "#C77B00",
+    "error":    "#A81F15",  # darker than brand red so alarms read as alarms
+    "on":       "#1A1A1A",  # primary text
+    "onvar":    "#6E6E6E",  # secondary text
+    "surface":  "#FFFFFF",  # page
+    "card":     "#FFFFFF",  # cards (hairline border separates)
+    "surflow":  "#F7F7F7",  # recessed fills
+    "outline":  "#B3B3B3",  # strong rules
+    "outvar":   "#E6E6E6",  # hairline rules / borders
+    "okbg":     "#E9F2E9",
+    "warnbg":   "#FBF0DC",
+    "warntx":   "#8A5800",
+    "oktx":     "#2C5E2E",
 }
-# Nova's typeface is Hexagon Akkurat (regular + bold); graceful fallbacks for
-# machines without it. Same stack is used for the HTML and the plots.
-FONT_STACK = ('"Hexagon Akkurat",Akkurat,"Segoe UI",Roboto,'
-              '"Helvetica Neue",Arial,sans-serif')
+# Classic Leica typography: Helvetica-family grotesque, regular + bold only.
+# Same stack for the HTML and the plots (DejaVu is matplotlib's fallback).
+FONT_STACK = '"Helvetica Neue",Helvetica,Arial,sans-serif'
 matplotlib.rcParams["font.family"] = "sans-serif"
 matplotlib.rcParams["font.sans-serif"] = [
-    "Hexagon Akkurat", "Akkurat", "Segoe UI", "Roboto",
-    "Helvetica Neue", "Arial", "DejaVu Sans"]
-SELECTION_COLORS = ["#005198", "#28721E", "#A144EA", "#8E5515", "#0E6991",
-                    "#BC1C1C", "#646E78", "#F569E2"]
+    "Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
+# Selections: brand red first, then muted classics that hold up on white.
+SELECTION_COLORS = ["#DA291C", "#1A1A1A", "#3A6EA5", "#2E7D32", "#7D4B9E",
+                    "#C77B00", "#2E7D7B", "#8E5515"]
+
+
+def find_logo():
+    """Official Leica Geosystems logo, embedded when present. Drop the asset
+    (from the brand portal) at tools/assets/leica_logo.svg|png|jpg — reports
+    pick it up automatically; otherwise a typographic wordmark is used."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.path.join(here, "assets"), here):
+        for n in ("leica_logo.svg", "leica_logo.png", "leica_logo.jpg"):
+            p = os.path.join(d, n)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def logo_html():
+    p = find_logo()
+    if p:
+        mime = {"svg": "image/svg+xml", "png": "image/png",
+                "jpg": "image/jpeg"}[p.rsplit(".", 1)[1]]
+        b64 = base64.b64encode(open(p, "rb").read()).decode("ascii")
+        return (f'<img class=logo src="data:{mime};base64,{b64}" '
+                'alt="Leica Geosystems">')
+    return ('<div class=wordmark>Leica<span>Geosystems</span></div>')
 
 DEG_PER_MG = 0.0573      # small-angle: 1 mg of accel offset ~ 0.0573 deg
 
@@ -216,18 +242,18 @@ def select_ranges_interactive(df, dwells):
     fig, (axp, axr) = plt.subplots(2, 1, sharex=True, figsize=(12, 6))
     fig.canvas.manager.set_window_title(
         "Drag to select ranges — u: undo, d: delete all, a: all, ENTER: done")
-    for ax, col, color, name in ((axp, "pitch_deg", NOVA["primary"], "pitch"),
-                                 (axr, "roll_deg", NOVA["info"], "roll")):
+    for ax, col, color, name in ((axp, "pitch_deg", LEICA["pitch"], "pitch"),
+                                 (axr, "roll_deg", LEICA["roll"], "roll")):
         ax.plot(*gap_broken(df["t_s"], df[col]), color=color, lw=0.8)
         ax.set_ylabel(f"{name} [deg]")
-        ax.grid(color=NOVA["outvar"], lw=0.5)
+        ax.grid(color=LEICA["outvar"], lw=0.5)
         for _, dw in dwells.iterrows():
-            ax.axvspan(dw["t0"], dw["t1"], color=NOVA["success"], alpha=0.08)
+            ax.axvspan(dw["t0"], dw["t1"], color=LEICA["success"], alpha=0.08)
     ev = df[df["event_flag"] == 1]
     for _, e in ev.iterrows():
-        axp.axvline(e["t_s"], color=NOVA["brand"], lw=1)
+        axp.axvline(e["t_s"], color=LEICA["brand"], lw=1)
         axp.annotate(str(e["event_label"]), (e["t_s"], axp.get_ylim()[1]),
-                     fontsize=7, rotation=90, va="top", color=NOVA["brand"])
+                     fontsize=7, rotation=90, va="top", color=LEICA["brand"])
     axr.set_xlabel("time since log start [s]")
     fig.suptitle("DRAG to add a selection  |  u: undo   d: delete all   a: whole log   "
                  "ENTER/close: done  |  zoom: o box / p pan / r reset (selections kept)",
@@ -268,7 +294,7 @@ def select_ranges_interactive(df, dwells):
             plt.close(fig)
 
     spans = [SpanSelector(ax, add_range, "horizontal", useblit=True,
-                          props=dict(alpha=0.15, facecolor=NOVA["primary"]))
+                          props=dict(alpha=0.15, facecolor=LEICA["pitch"]))
              for ax in (axp, axr)]
     fig.canvas.mpl_connect("key_press_event", on_key)
     print("Selection window open — drag to select ranges, ENTER when done.\n"
@@ -417,36 +443,36 @@ def fig_to_b64(fig):
 
 
 def style_axes(ax):
-    ax.grid(color=NOVA["outvar"], lw=0.6)
+    ax.grid(color=LEICA["outvar"], lw=0.6)
     for spine in ax.spines.values():
-        spine.set_color(NOVA["outline"])
-    ax.tick_params(colors=NOVA["onvar"], labelsize=8)
-    ax.xaxis.label.set_color(NOVA["on"])
-    ax.yaxis.label.set_color(NOVA["on"])
-    ax.title.set_color(NOVA["on"])
+        spine.set_color(LEICA["outline"])
+    ax.tick_params(colors=LEICA["onvar"], labelsize=8)
+    ax.xaxis.label.set_color(LEICA["on"])
+    ax.yaxis.label.set_color(LEICA["on"])
+    ax.title.set_color(LEICA["on"])
 
 
 def plot_timeseries(df, dwells, ranges):
     fig, (axp, axr, axt) = plt.subplots(3, 1, sharex=True, figsize=(11, 6.4),
                                         height_ratios=[3, 3, 1.4])
-    fig.patch.set_facecolor(NOVA["card"])
-    for ax, col, color, name in ((axp, "pitch_deg", NOVA["primary"], "pitch [deg]"),
-                                 (axr, "roll_deg", NOVA["info"], "roll [deg]")):
+    fig.patch.set_facecolor(LEICA["card"])
+    for ax, col, color, name in ((axp, "pitch_deg", LEICA["pitch"], "pitch [deg]"),
+                                 (axr, "roll_deg", LEICA["roll"], "roll [deg]")):
         ax.plot(*gap_broken(df["t_s"], df[col]), color=color, lw=0.8)
         ax.set_ylabel(name)
         style_axes(ax)
         for _, dw in dwells.iterrows():
-            ax.axvspan(dw["t0"], dw["t1"], color=NOVA["success"], alpha=0.08)
+            ax.axvspan(dw["t0"], dw["t1"], color=LEICA["success"], alpha=0.08)
         for k, (a, b) in enumerate(ranges):
             ax.axvspan(a, b, color=SELECTION_COLORS[k % len(SELECTION_COLORS)], alpha=0.18)
-    axt.plot(*gap_broken(df["t_s"], df["imu_temp_c"]), color=NOVA["warning"], lw=0.9)
+    axt.plot(*gap_broken(df["t_s"], df["imu_temp_c"]), color=LEICA["temp"], lw=0.9)
     axt.set_ylabel("IMU [°C]")
     axt.set_xlabel("time since log start [s]")
     style_axes(axt)
     for _, e in df[df["event_flag"] == 1].iterrows():
-        axp.axvline(e["t_s"], color=NOVA["brand"], lw=1)
+        axp.axvline(e["t_s"], color=LEICA["brand"], lw=1)
         axp.annotate(str(e["event_label"]), (e["t_s"], axp.get_ylim()[1]),
-                     fontsize=6.5, rotation=90, va="top", color=NOVA["brand"])
+                     fontsize=6.5, rotation=90, va="top", color=LEICA["brand"])
     for k, (a, b) in enumerate(ranges):
         axp.annotate(f"S{k+1}", ((a + b) / 2, axp.get_ylim()[0]), fontsize=9,
                      ha="center", va="bottom", fontweight="bold",
@@ -457,11 +483,11 @@ def plot_timeseries(df, dwells, ranges):
 
 def plot_2d(df, results, ranges):
     fig, ax = plt.subplots(figsize=(7.4, 7.4))
-    fig.patch.set_facecolor(NOVA["card"])
+    fig.patch.set_facecolor(LEICA["card"])
     style_axes(ax)
-    ax.axhline(0, color=NOVA["outvar"], lw=0.8)
-    ax.axvline(0, color=NOVA["outvar"], lw=0.8)
-    ax.add_patch(Circle((0, 0), TARGET_DEG, fill=False, color=NOVA["success"],
+    ax.axhline(0, color=LEICA["outvar"], lw=0.8)
+    ax.axvline(0, color=LEICA["outvar"], lw=0.8)
+    ax.add_patch(Circle((0, 0), TARGET_DEG, fill=False, color=LEICA["success"],
                         lw=1.4, label=f"target ±{TARGET_DEG:g}°"))
     lim = TARGET_DEG * 1.4
     for k, ((a, b), res) in enumerate(zip(ranges, results)):
@@ -496,10 +522,10 @@ def plot_2d(df, results, ranges):
     sy = ax.secondary_yaxis("right", functions=(
         lambda d: np.tan(np.radians(d)) * PLATE_ALONG_PITCH_MM * 1000.0,
         lambda u: np.degrees(np.arctan(u / (PLATE_ALONG_PITCH_MM * 1000.0)))))
-    sx.set_xlabel(f"displacement over {PLATE_ALONG_ROLL_MM:g} mm [µm]", fontsize=8, color=NOVA["onvar"])
-    sy.set_ylabel(f"displacement over {PLATE_ALONG_PITCH_MM:g} mm [µm]", fontsize=8, color=NOVA["onvar"])
-    sx.tick_params(colors=NOVA["onvar"], labelsize=7)
-    sy.tick_params(colors=NOVA["onvar"], labelsize=7)
+    sx.set_xlabel(f"displacement over {PLATE_ALONG_ROLL_MM:g} mm [µm]", fontsize=8, color=LEICA["onvar"])
+    sy.set_ylabel(f"displacement over {PLATE_ALONG_PITCH_MM:g} mm [µm]", fontsize=8, color=LEICA["onvar"])
+    sx.tick_params(colors=LEICA["onvar"], labelsize=7)
+    sy.tick_params(colors=LEICA["onvar"], labelsize=7)
     ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
     ax.set_title("2-D tilt — circle of confusion (dashed, R95) per selection; "
                  "+ mean, ○ dwell means", fontsize=10)
@@ -518,7 +544,7 @@ def plot_2d_details(df, results, ranges):
     nc = min(3, len(items))
     nr = -(-len(items) // nc)
     fig, axes = plt.subplots(nr, nc, figsize=(3.6 * nc + 0.6, 3.6 * nr + 0.3))
-    fig.patch.set_facecolor(NOVA["card"])
+    fig.patch.set_facecolor(LEICA["card"])
     axes = np.atleast_1d(axes).ravel()
     for ax in axes[len(items):]:
         ax.set_visible(False)
@@ -530,8 +556,8 @@ def plot_2d_details(df, results, ranges):
         rx = (used["roll_deg"].to_numpy() - cx) * 1000.0
         ry = (used["pitch_deg"].to_numpy() - cy) * 1000.0
         style_axes(ax)
-        ax.axhline(0, color=NOVA["outvar"], lw=0.8)
-        ax.axvline(0, color=NOVA["outvar"], lw=0.8)
+        ax.axhline(0, color=LEICA["outvar"], lw=0.8)
+        ax.axvline(0, color=LEICA["outvar"], lw=0.8)
         ax.scatter(rx, ry, s=7, color=col, alpha=0.40, lw=0)
         ax.scatter([0], [0], s=60, color=col, marker="+", lw=1.6)
         ax.add_patch(Circle((0, 0), r95 * 1000.0, fill=False, color=col,
@@ -561,71 +587,77 @@ def plot_allan(run, dt):
     taus_p, ad_p = allan_deviation(run["pitch_deg"].to_numpy(), dt)
     taus_r, ad_r = allan_deviation(run["roll_deg"].to_numpy(), dt)
     fig, ax = plt.subplots(figsize=(7.6, 4.6))
-    fig.patch.set_facecolor(NOVA["card"])
-    ax.loglog(taus_p, ad_p, "o-", ms=3, lw=1.1, color=NOVA["primary"], label="pitch")
-    ax.loglog(taus_r, ad_r, "o-", ms=3, lw=1.1, color=NOVA["info"], label="roll")
+    fig.patch.set_facecolor(LEICA["card"])
+    ax.loglog(taus_p, ad_p, "o-", ms=3, lw=1.1, color=LEICA["pitch"], label="pitch")
+    ax.loglog(taus_r, ad_r, "o-", ms=3, lw=1.1, color=LEICA["roll"], label="roll")
     if len(ad_p):
         i = int(np.argmin(ad_p))
         ax.annotate(f"floor ≈ {ad_p[i]*1000:.2f} m° @ τ={taus_p[i]:.0f} s",
                     (taus_p[i], ad_p[i]), textcoords="offset points",
-                    xytext=(8, -12), fontsize=8, color=NOVA["primary"])
+                    xytext=(8, -12), fontsize=8, color=LEICA["pitch"])
     style_axes(ax)
     ax.set_xlabel("averaging time τ [s]")
     ax.set_ylabel("Allan deviation [deg]")
     ax.legend(fontsize=9)
     ax.set_title(f"Allan deviation — longest settled run "
                  f"({len(run)} pts @ {dt:.1f} s)", fontsize=10)
-    ax.grid(which="minor", color=NOVA["outvar"], lw=0.4, alpha=0.6)
+    ax.grid(which="minor", color=LEICA["outvar"], lw=0.4, alpha=0.6)
     return fig_to_b64(fig), (taus_p, ad_p, taus_r, ad_r)
 
 
 # -----------------------------------------------------------------------------
 # HTML report
 # -----------------------------------------------------------------------------
-# Nova light theme (sys.palette tokens), Hexagon Akkurat, Major-Second scale:
-# body 14/20 (body-small — data-dense document), title 23/34, labels 12/18.
+# Classic Leica theme (docs/DESIGN.md): white page, hairline rules, graphite
+# text, red reserved for brand + key figures. Body 14/20, title 23/34.
 CSS = f"""
 *{{box-sizing:border-box}}
-body{{background:{NOVA['surface']};color:{NOVA['on']};max-width:880px;margin:0 auto;
+body{{background:{LEICA['surface']};color:{LEICA['on']};max-width:880px;margin:0 auto;
  font:14px/20px {FONT_STACK};padding:24px 18px 48px}}
 header{{margin-bottom:18px}}
+.brandrow{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}}
+.logo{{height:52px;width:auto;flex:none}}
+.wordmark{{font-size:24px;line-height:24px;font-weight:800;color:{LEICA['brand']};
+ letter-spacing:-.02em;text-align:right;flex:none}}
+.wordmark span{{display:block;font-size:13px;line-height:18px;font-weight:700;
+ letter-spacing:.02em}}
 .overline{{font-size:12px;line-height:18px;font-weight:700;letter-spacing:.08em;
- text-transform:uppercase;color:{NOVA['onvar']}}}
+ text-transform:uppercase;color:{LEICA['brand']}}}
 h1{{font-size:23px;line-height:34px;font-weight:700;margin:2px 0 0}}
-.sub{{font-size:12px;line-height:18px;color:{NOVA['onvar']};margin-top:2px}}
-.accent{{height:3px;width:64px;background:{NOVA['brand']};border-radius:2px;margin-top:10px}}
+.sub{{font-size:12px;line-height:18px;color:{LEICA['onvar']};margin-top:2px}}
+.accent{{height:3px;width:100%;background:{LEICA['brand']};margin-top:14px}}
 h2{{font-size:16px;line-height:24px;font-weight:700;margin:28px 0 8px}}
 .hero{{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px;
  margin:16px 0}}
-.tile{{background:{NOVA['card']};border:1px solid {NOVA['outvar']};border-radius:12px;
+.tile{{background:{LEICA['card']};border:1px solid {LEICA['outvar']};border-radius:12px;
  padding:10px 12px}}
-.tile .l{{font-size:12px;line-height:18px;color:{NOVA['onvar']}}}
+.tile .l{{font-size:12px;line-height:18px;color:{LEICA['onvar']}}}
 .tile .v{{font-size:18px;line-height:26px;font-weight:700;font-variant-numeric:tabular-nums}}
-.tile .s{{font-size:12px;line-height:18px;color:{NOVA['onvar']};font-variant-numeric:tabular-nums}}
+.tile .s{{font-size:12px;line-height:18px;color:{LEICA['onvar']};font-variant-numeric:tabular-nums}}
 .chip{{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px;
  line-height:18px;font-weight:700}}
-.chip.ok{{background:{NOVA['okbg']};color:{NOVA['oktx']}}}
-.chip.warn{{background:{NOVA['warnbg']};color:{NOVA['warntx']}}}
-.card{{background:{NOVA['card']};border:1px solid {NOVA['outvar']};border-radius:12px;
+.chip.ok{{background:{LEICA['okbg']};color:{LEICA['oktx']}}}
+.chip.warn{{background:{LEICA['warnbg']};color:{LEICA['warntx']}}}
+.card{{background:{LEICA['card']};border:1px solid {LEICA['outvar']};border-radius:12px;
  padding:12px;margin:10px 0}}
 img{{max-width:100%;border-radius:8px;display:block;margin:0 auto}}
 table{{border-collapse:collapse;width:100%;font-size:12.5px;line-height:18px}}
-th,td{{border-bottom:1px solid {NOVA['outvar']};padding:5px 8px;text-align:right;
+th,td{{border-bottom:1px solid {LEICA['outvar']};padding:5px 8px;text-align:right;
  font-variant-numeric:tabular-nums}}
 tr:last-child td{{border-bottom:none}}
-th{{color:{NOVA['onvar']};font-weight:700;font-size:11px;letter-spacing:.04em}}
+th{{color:{LEICA['onvar']};font-weight:700;font-size:11px;letter-spacing:.04em}}
 td:first-child,th:first-child{{text-align:left}}
 .kv td{{text-align:left}}
-.note{{font-size:12px;line-height:18px;color:{NOVA['onvar']}}}
-.warnbox{{background:{NOVA['warnbg']};color:{NOVA['warntx']};border-radius:8px;
+.note{{font-size:12px;line-height:18px;color:{LEICA['onvar']}}}
+.warnbox{{background:{LEICA['warnbg']};color:{LEICA['warntx']};border-radius:8px;
  padding:8px 12px;font-size:12.5px;line-height:18px;margin:8px 0}}
 .dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}}
 details{{margin:18px 0}}
 details>summary{{cursor:pointer;font-size:16px;line-height:24px;font-weight:700;
  list-style:none}}
-details>summary::before{{content:"▸ ";color:{NOVA['onvar']}}}
+details>summary::before{{content:"▸ ";color:{LEICA['onvar']}}}
 details[open]>summary::before{{content:"▾ "}}
-footer{{margin-top:32px;font-size:12px;line-height:18px;color:{NOVA['onvar']}}}
+footer{{margin-top:32px;font-size:12px;line-height:18px;color:{LEICA['onvar']}}}
 """
 
 
@@ -769,9 +801,14 @@ displacement across the plate ({PLATE_ALONG_PITCH_MM:g} mm pitch /
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>{title}</title><style>{CSS}</style></head><body>
 <header>
-<div class=overline>Leica Geosystems · Static Level Logger</div>
+<div class=brandrow>
+<div>
+<div class=overline>Static Level Logger</div>
 <h1>{title}</h1>
 <div class=sub>{span_wall} · generated {_dt.datetime.now():%Y-%m-%d %H:%M}</div>
+</div>
+{logo_html()}
+</div>
 <div class=accent></div>
 </header>
 
@@ -798,7 +835,7 @@ across the plate. * = below the required measurement time / sample size.</p>
 {allan_html}
 {session_html}
 
-<footer>evaluate_level_log.py · Nova light theme</footer>
+<footer>evaluate_level_log.py · classic Leica theme (docs/DESIGN.md)</footer>
 </body></html>"""
     return html
 
