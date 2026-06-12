@@ -473,7 +473,7 @@ def plot_2d(df, results, ranges):
         x, y = used["roll_deg"].to_numpy(), used["pitch_deg"].to_numpy()
         cx, cy, r95 = res["roll"]["mean"], res["pitch"]["mean"], res["coc_r95"]
         ax.scatter(x, y, s=4, color=col, alpha=0.30, lw=0)
-        low_n = "  ⚠ low n" if res["warnings"] else ""
+        low_n = " *" if res["warnings"] else ""   # ASCII: ⚠ is tofu in many fonts
         ax.scatter([cx], [cy], s=70, color=col, marker="+", lw=1.8,
                    label=f"S{k+1}  R95 {r95*1000:.1f} m° (n={len(x)}){low_n}")
         # circle of confusion: 95 % of the samples fall inside the dashed ring
@@ -503,6 +503,57 @@ def plot_2d(df, results, ranges):
     ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
     ax.set_title("2-D tilt — circle of confusion (dashed, R95) per selection; "
                  "+ mean, ○ dwell means", fontsize=10)
+    return fig_to_b64(fig)
+
+
+def plot_2d_details(df, results, ranges):
+    """One small panel per valid selection, in residual coordinates (deviation
+    from the selection mean, m°). The overview plot's axis range is set by the
+    distance BETWEEN locations, so a few-m° circle of confusion is smaller
+    than a pixel there; at true scale per selection it surrounds the points."""
+    items = [(k, ab, r) for k, (ab, r) in enumerate(zip(ranges, results))
+             if r.get("valid")]
+    if not items:
+        return None
+    nc = min(3, len(items))
+    nr = -(-len(items) // nc)
+    fig, axes = plt.subplots(nr, nc, figsize=(3.6 * nc + 0.6, 3.6 * nr + 0.3))
+    fig.patch.set_facecolor(NOVA["card"])
+    axes = np.atleast_1d(axes).ravel()
+    for ax in axes[len(items):]:
+        ax.set_visible(False)
+    for ax, (k, (a, b), res) in zip(axes, items):
+        sel = df[(df["t_s"] >= a) & (df["t_s"] <= b)]
+        used = sel[sel["settled"] == 1] if res["settled_only"] else sel
+        col = SELECTION_COLORS[k % len(SELECTION_COLORS)]
+        cx, cy, r95 = res["roll"]["mean"], res["pitch"]["mean"], res["coc_r95"]
+        rx = (used["roll_deg"].to_numpy() - cx) * 1000.0
+        ry = (used["pitch_deg"].to_numpy() - cy) * 1000.0
+        style_axes(ax)
+        ax.axhline(0, color=NOVA["outvar"], lw=0.8)
+        ax.axvline(0, color=NOVA["outvar"], lw=0.8)
+        ax.scatter(rx, ry, s=7, color=col, alpha=0.40, lw=0)
+        ax.scatter([0], [0], s=60, color=col, marker="+", lw=1.6)
+        ax.add_patch(Circle((0, 0), r95 * 1000.0, fill=False, color=col,
+                            ls="--", lw=1.4))
+        dsel = res.get("dwell_table")
+        if dsel is not None and len(dsel):
+            ax.scatter((dsel["roll_mean"] - cx) * 1000.0,
+                       (dsel["pitch_mean"] - cy) * 1000.0, s=30, marker="o",
+                       facecolors="none", edgecolors=col, lw=1.1)
+        lim = max(r95 * 1000.0 * 1.4,
+                  float(np.max(np.abs(np.concatenate([rx, ry])))) * 1.15
+                  if len(rx) else 1.0, 1.0)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect("equal")
+        warn = " *" if res["warnings"] else ""
+        ax.set_title(f"S{k+1} — R95 {r95*1000:.1f} m°{warn}", fontsize=9,
+                     color=col, fontweight="bold")
+        ax.tick_params(labelsize=7)
+        ax.set_xlabel("Δroll [m°]", fontsize=8)
+        ax.set_ylabel("Δpitch [m°]", fontsize=8)
+    fig.tight_layout()
     return fig_to_b64(fig)
 
 
@@ -731,9 +782,14 @@ displacement across the plate ({PLATE_ALONG_PITCH_MM:g} mm pitch /
 
 <h2>2-D tilt</h2>
 <div class=card><img src="data:image/png;base64,{imgs['2d']}">
-<p class=note>Dashed ring = circle of confusion (R95): 95 % of the selection's
-samples fall inside it. Green circle = ±{TARGET_DEG:g}° target. Secondary axes:
-height displacement across the plate.</p></div>
+<p class=note>Overview: dashed ring = circle of confusion (R95: 95 % of the
+selection's samples fall inside it) — often smaller than a pixel at this scale.
+Green circle = ±{TARGET_DEG:g}° target. Secondary axes: height displacement
+across the plate. * = below the required measurement time / sample size.</p>
+{f'<img src="data:image/png;base64,{imgs["2ddet"]}" style="margin-top:10px">'
+ f'<p class=note>Detail per selection at true scale — the dashed R95 ring is the '
+ f'measurement uncertainty around the mean (+); ○ = individual placements.</p>'
+ if imgs.get("2ddet") else ''}</div>
 
 <h2>Selections</h2>
 <div class=card>{selection_table_html(results)}{repeat_html}</div>
@@ -890,7 +946,8 @@ def main():
                for a, b in ranges]
 
     imgs = {"ts": plot_timeseries(df, dwells, ranges),
-            "2d": plot_2d(df, results, ranges)}
+            "2d": plot_2d(df, results, ranges),
+            "2ddet": plot_2d_details(df, results, ranges)}
     run, dt = longest_settled_run(df)
     allan_info = plot_allan(run, dt) if run is not None else None
     if allan_info is None:
